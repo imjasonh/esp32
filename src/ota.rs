@@ -84,7 +84,13 @@ struct TokenResponse {
 
 /// Background loop. Runs forever; never returns. Spawn in a thread.
 /// Reads configuration from NVS on startup, with compile-time defaults.
-pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
+/// `trust` was loaded by main.rs at boot from NVS — passed in here so
+/// we don't re-open the NVS namespace on every poll.
+pub fn run(
+    nvs_partition: EspDefaultNvsPartition,
+    fw_version: &str,
+    trust: crate::trust::TrustConfig,
+) -> ! {
     let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
         Ok(n) => n,
         Err(e) => {
@@ -120,7 +126,7 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
             "ota: sleeping",
         );
         std::thread::sleep(sleep_for);
-        match poll_once(&mut nvs, &cfg) {
+        match poll_once(&mut nvs, &cfg, &trust) {
             Ok(PollOutcome::NoChange) => {
                 consecutive_failures = 0;
                 tracing::info!("ota: no change");
@@ -169,7 +175,11 @@ enum PollOutcome {
     Updated(String),
 }
 
-fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcome> {
+fn poll_once(
+    nvs: &mut EspNvs<NvsDefault>,
+    cfg: &OtaConfig,
+    trust: &crate::trust::TrustConfig,
+) -> Result<PollOutcome> {
     let token = fetch_anon_token(&cfg.repo)?;
 
     // Fetch manifest and compute its SHA256 — that's the manifest digest
@@ -204,7 +214,7 @@ fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcom
     // (much larger) firmware download. Refuses unknown signers.
     let bundle = fetch_signature_bundle(&cfg.repo, &manifest_digest_hex, &token)
         .context("fetch signature bundle")?;
-    crate::sig::verify_bundle(&bundle, &manifest_digest_hex)
+    crate::sig::verify_bundle(&bundle, &manifest_digest_hex, trust)
         .context("verify signature bundle")?;
     tracing::info!("ota: signature verified, proceeding with download");
 

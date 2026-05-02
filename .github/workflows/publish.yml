@@ -2,12 +2,14 @@ name: Publish OTA
 
 # Build the firmware on every push to main, push it as an OCI artifact
 # to ghcr.io/imjasonh/esp32, and sign it keylessly with cosign using
-# the workflow's ambient OIDC token. The on-device verifier in
-# src/trust.rs trusts this workflow's identity for OTA updates.
+# the workflow's ambient OIDC token. The on-device verifier (src/sig.rs)
+# trusts this workflow's identity (provisioned into the device's NVS).
 #
-# Required repo secrets:
-#   WIFI_SSID, WIFI_PASS — embedded into the firmware at compile time
-#   (see src/main.rs env!()). The GITHUB_TOKEN is auto-provided.
+# Published image is device-agnostic: contains no Wi-Fi creds, no
+# trust roots, no GCP keys. Per-device config lives in NVS and is
+# written via USB by `make provision`. See provisioning-plan.md.
+#
+# Only secret needed: GITHUB_TOKEN (auto-provided by the runner).
 
 on:
   push:
@@ -71,19 +73,14 @@ jobs:
             tools/publisher
           shared-key: publish
 
-      - name: Write env files from secrets
+      - name: Write gh.env from GITHUB_TOKEN
         env:
-          WIFI_SSID: ${{ secrets.WIFI_SSID }}
-          WIFI_PASS: ${{ secrets.WIFI_PASS }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `make publish` sources gh.env for cosign's registry auth.
+        # %q escapes for safe sourcing regardless of special chars.
         run: |
-          # %q escapes for safe sourcing regardless of special chars.
-          {
-            printf 'export WIFI_SSID=%q\n' "$WIFI_SSID"
-            printf 'export WIFI_PASS=%q\n' "$WIFI_PASS"
-          } > wifi.env
           printf 'export GH_TOKEN=%q\n' "$GH_TOKEN" > gh.env
-          chmod 600 wifi.env gh.env
+          chmod 600 gh.env
 
       - name: Build, push, and sign
         env:

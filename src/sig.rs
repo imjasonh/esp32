@@ -18,7 +18,7 @@ use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::Certificate;
 
-use crate::trust;
+use crate::trust::TrustConfig;
 
 // X.509 OID for Sigstore's "OIDC issuer (legacy)" extension. The value
 // is the raw issuer URL bytes (not DER-wrapped). Fulcio also emits
@@ -72,7 +72,11 @@ struct InTotoSubject {
 
 /// Verify a Sigstore bundle JSON against an expected manifest digest.
 /// `expected_manifest_digest_hex` is the hex string (no `sha256:`).
-pub fn verify_bundle(bundle_json: &[u8], expected_manifest_digest_hex: &str) -> Result<()> {
+pub fn verify_bundle(
+    bundle_json: &[u8],
+    expected_manifest_digest_hex: &str,
+    trust: &TrustConfig,
+) -> Result<()> {
     let bundle: Bundle = serde_json::from_slice(bundle_json).context("parse bundle JSON")?;
 
     let cert_der = b64_std()
@@ -82,15 +86,16 @@ pub fn verify_bundle(bundle_json: &[u8], expected_manifest_digest_hex: &str) -> 
 
     let identity = extract_san_identity(&leaf).context("extract SAN identity")?;
     let issuer = extract_oidc_issuer_v1(&leaf).context("extract OIDC issuer")?;
-    if !trust::TRUSTED_IDENTITIES
+    if !trust
+        .identities
         .iter()
-        .any(|(id, iss)| *id == identity && *iss == issuer)
+        .any(|t| t.identity == identity && t.issuer == issuer)
     {
         bail!("untrusted identity: {} (issuer {})", identity, issuer);
     }
     tracing::info!(identity = %identity, issuer = %issuer, "ota: signer identity OK");
 
-    verify_chain(&leaf).context("cert chain verification")?;
+    verify_chain(&leaf, trust).context("cert chain verification")?;
     tracing::info!("ota: cert chain to Sigstore root OK");
 
     let sig_bytes = b64_std()
@@ -193,20 +198,20 @@ fn extract_oidc_issuer_v1(cert: &Certificate) -> Result<String> {
     bail!("no OIDC issuer (1.3.6.1.4.1.57264.1.1) extension")
 }
 
-/// Verify leaf was signed by the bundled Sigstore intermediate, and
-/// that the bundled intermediate was signed by the bundled root.
-fn verify_chain(leaf: &Certificate) -> Result<()> {
-    let intermediate = pem_to_cert(trust::SIGSTORE_INTERMEDIATE_PEM)?;
-    let root = pem_to_cert(trust::SIGSTORE_ROOT_PEM)?;
+/// Verify leaf was signed by the provisioned Sigstore intermediate, and
+/// that the provisioned intermediate was signed by the provisioned root.
+fn verify_chain(leaf: &Certificate, trust: &TrustConfig) -> Result<()> {
+    let intermediate = pem_to_cert(&trust.fulcio_intermediate_pem)?;
+    let root = pem_to_cert(&trust.fulcio_root_pem)?;
 
     verify_signed_by_p384(leaf, &intermediate).context("leaf -> intermediate")?;
     verify_signed_by_p384(&intermediate, &root).context("intermediate -> root")?;
     Ok(())
 }
 
-fn pem_to_cert(pem: &str) -> Result<Certificate> {
-    let (label, der) = x509_cert::der::pem::decode_vec(pem.as_bytes())
-        .map_err(|e| anyhow!("decode PEM: {}", e))?;
+fn pem_to_cert(pem: &[u8]) -> Result<Certificate> {
+    let (label, der) =
+        x509_cert::der::pem::decode_vec(pem).map_err(|e| anyhow!("decode PEM: {}", e))?;
     if label != "CERTIFICATE" {
         bail!("unexpected PEM label: {}", label);
     }

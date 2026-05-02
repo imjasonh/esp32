@@ -54,18 +54,10 @@ jobs:
         with:
           shared-key: ci-firmware
 
-      - name: Write placeholder wifi.env
-        # The firmware embeds WIFI_SSID/WIFI_PASS at compile time via
-        # env!() but doesn't validate them. CI just needs the build to
-        # succeed; runtime Wi-Fi connect with these placeholders would
-        # fail, but that's not what CI is testing.
-        run: |
-          {
-            echo 'export WIFI_SSID="ci-placeholder"'
-            echo 'export WIFI_PASS="ci-placeholder"'
-          } > wifi.env
-
       - name: Build firmware
+        # No wifi.env needed — the firmware reads Wi-Fi creds from NVS
+        # at runtime, not from env!() at compile time. The published
+        # OCI image is device-agnostic.
         run: make build
 
   publisher:
@@ -85,3 +77,18 @@ jobs:
         # `target = "xtensa-esp32-espidf"`. Hardcoded triple is fine
         # because we control the runner (ubuntu-latest = x86_64-linux).
         run: cd tools/publisher && cargo build --release --target x86_64-unknown-linux-gnu
+
+  provision:
+    name: build provision
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/provision
+          shared-key: ci-provision
+
+      - name: Build provision
+        run: cd tools/provision && cargo build --release --target x86_64-unknown-linux-gnu
