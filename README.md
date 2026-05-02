@@ -22,7 +22,7 @@ GHCR + cosign keyless signing. E-ink display work coming next (see
 
 Push to `main` → CI builds → publish workflow pushes a signed image to
 GHCR → device picks it up on its next poll. See
-[`ota-plan.md`](ota-plan.md) for the full design.
+[`ota.md`](ota.md) for the full design.
 
 ## Hardware
 
@@ -62,7 +62,7 @@ make publish    Build, push OCI artifact to ghcr.io/imjasonh/esp32, cosign sign
 make clean      cargo clean
 ```
 
-`make publish` requires `gh.env` (see [`ota-plan.md`](ota-plan.md) for
+`make publish` requires `gh.env` (see [`ota.md`](ota.md) for
 PAT setup) and a real cosign OIDC flow the first time per ~10min window
 — a browser pops to authenticate. CI does this automatically via the
 GitHub Actions workflow's ambient OIDC token.
