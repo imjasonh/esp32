@@ -1,7 +1,10 @@
 /target
 /.embuild
-Cargo.lock
 wifi.env
 gh.env
 sdkconfig.defaults
 tools/publisher/target
+
+# Cargo.lock IS tracked: both crates here are binaries (firmware and
+# publisher), and binary Cargo.lock files should be committed for
+# reproducible builds.
