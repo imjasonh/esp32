@@ -43,13 +43,11 @@ jobs:
           buildtargets: esp32
           ldproxy: true
 
-      - name: Cache .embuild (ESP-IDF + tools)
-        uses: actions/cache@v5
-        with:
-          path: .embuild
-          key: embuild-v5.2.2-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
-          restore-keys: |
-            embuild-v5.2.2-${{ runner.os }}-
+      # Intentionally not caching .embuild here. Sharing the cache
+      # with publish.yml led to "too many levels of symbolic links"
+      # in the IDF venv (absolute symlinks baked in by one runner
+      # don't resolve cleanly on another). CI gets a slower cold
+      # build each time; the trade-off is reproducibility.
 
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
@@ -83,4 +81,7 @@ jobs:
           shared-key: ci-publisher
 
       - name: Build publisher
-        run: cd tools/publisher && cargo build --release
+        # Explicit --target overrides the parent .cargo/config.toml's
+        # `target = "xtensa-esp32-espidf"`. Hardcoded triple is fine
+        # because we control the runner (ubuntu-latest = x86_64-linux).
+        run: cd tools/publisher && cargo build --release --target x86_64-unknown-linux-gnu
