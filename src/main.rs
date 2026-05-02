@@ -65,7 +65,7 @@ fn main() -> Result<()> {
         // mbedtls alone wants several KB. 32 KB has headroom; observed
         // failures at 8 KB.
         .stack_size(32 * 1024)
-        .spawn(move || ota::run(ota_nvs, ota::OtaConfig::default()))
+        .spawn(move || ota::run(ota_nvs, FW_VERSION))
         .expect("spawn ota thread");
 
     log::info!("main: idling, OTA loop running in background");

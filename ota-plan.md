@@ -161,24 +161,42 @@ Deferred to phase 3:
   defaults: `ghcr.io/imjasonh/esp32:latest`, 60s)
 - Force-update GPIO button
 
-### Phase 3 — operational glue
+### Phase 3 — operational glue ✅ DONE (partial)
 
-- NVS schema for OTA:
-  ```
-  ota_repo            string   ghcr.io/<user>/esp32-fw
-  ota_tag             string   latest
-  poll_interval_secs  u32      600
-  last_applied_digest string   sha256:...
-  pending_digest      string   sha256:... (set during update, cleared on validate)
-  consecutive_failures u32     for backoff
-  ```
-- Backoff: 10 min on success, doubling on failure capped at 1 h, with
-  ±10% jitter so a fleet doesn't poll in lockstep.
-- Force-update GPIO: short-press a button → skip the wait and poll now.
-- Structured log lines for each transition: `polled noop`, `polled
-  changed X→Y`, `downloaded N bytes`, `rebooting`, `validated`,
-  `rollback armed`.
-- `make publish-and-watch` = `make publish` then `make monitor`.
+Shipped:
+- **Exponential backoff with ±10% jitter on errors.** `ota::run`
+  tracks `consecutive_failures`. Sleep grows as
+  `poll_interval * 2^failures` capped at `BACKOFF_CAP` = 1h. Jitter
+  is also applied on the success path so a fleet doesn't poll in
+  lockstep. Randomness via `esp_random()`.
+- **NVS-readable config.** `OtaConfig::load_from_nvs()` reads
+  `repo` (str), `tag` (str), `poll_secs` (u32) from the `ota`
+  namespace, falling back to compile-time defaults
+  (`ghcr.io/imjasonh/esp32:latest`, 60s) when keys are absent.
+- **Boot summary log.** First line emitted by the OTA thread on
+  startup: `ota: boot summary fw=... repo=... tag=... poll=...s
+  last_digest=...`. One grep gives you the device's full OTA state.
+- **Compose `make publish monitor`** — no fused target, just chain
+  the existing two. (See `feedback_make_target_naming.md`.)
+
+NVS schema as shipped:
+```
+repo            str   defaults to "ghcr.io/imjasonh/esp32"
+tag             str   defaults to "latest"
+poll_secs       u32   defaults to 60
+last_digest     str   set after a successful mark-valid
+pending_digest  str   set during update, promoted on mark-valid
+```
+
+Deferred (low value, or needs hardware/provisioning we don't have yet):
+- **If-None-Match** on manifest fetches — marginal savings since we
+  already digest-compare locally; the manifest itself is ~500 bytes.
+- **Force-update GPIO button** — needs a button wired to a GPIO; no
+  breadboard yet.
+- **NVS provisioning mechanism** — currently the NVS-configurable
+  settings can only be *read* by the firmware. To actually set them
+  from outside we'd need a serial console command, a small HTTP
+  endpoint on the device, or a config-as-OCI-artifact channel.
 
 ### Phase 4 — keyless cosign + Rekor (future)
 

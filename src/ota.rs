@@ -17,6 +17,15 @@ use std::time::Duration;
 const NVS_NAMESPACE: &str = "ota";
 const NVS_LAST_DIGEST: &str = "last_digest";
 const NVS_PENDING_DIGEST: &str = "pending_digest";
+// Operator-tunable settings; if a key is absent we fall back to the
+// compile-time defaults in OtaConfig::default(). Writing these requires
+// a future provisioning mechanism (HTTP endpoint or serial console);
+// for now they're read-only-from-the-firmware's-perspective.
+const NVS_REPO: &str = "repo";
+const NVS_TAG: &str = "tag";
+const NVS_POLL_SECS: &str = "poll_secs";
+
+const BACKOFF_CAP: Duration = Duration::from_secs(3600); // 1h max between polls
 
 /// Where to fetch firmware from.
 pub struct OtaConfig {
@@ -33,6 +42,24 @@ impl Default for OtaConfig {
             // 60s for development; ota-plan.md targets 600s in steady state.
             poll_interval: Duration::from_secs(60),
         }
+    }
+}
+
+impl OtaConfig {
+    fn load_from_nvs(nvs: &EspNvs<NvsDefault>) -> Self {
+        let mut cfg = Self::default();
+        if let Some(repo) = read_string(nvs, NVS_REPO) {
+            cfg.repo = repo;
+        }
+        if let Some(tag) = read_string(nvs, NVS_TAG) {
+            cfg.tag = tag;
+        }
+        if let Ok(Some(secs)) = nvs.get_u32(NVS_POLL_SECS) {
+            if secs > 0 {
+                cfg.poll_interval = Duration::from_secs(secs as u64);
+            }
+        }
+        cfg
     }
 }
 
@@ -56,7 +83,8 @@ struct TokenResponse {
 }
 
 /// Background loop. Runs forever; never returns. Spawn in a thread.
-pub fn run(nvs_partition: EspDefaultNvsPartition, cfg: OtaConfig) -> ! {
+/// Reads configuration from NVS on startup, with compile-time defaults.
+pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
     let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
         Ok(n) => n,
         Err(e) => {
@@ -68,25 +96,70 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, cfg: OtaConfig) -> ! {
         }
     };
 
+    let cfg = OtaConfig::load_from_nvs(&nvs);
+    let last = read_string(&nvs, NVS_LAST_DIGEST).unwrap_or_else(|| "<none>".into());
     log::info!(
-        "ota: polling {}:{} every {}s",
+        "ota: boot summary fw={} repo={} tag={} poll={}s last_digest={}",
+        fw_version,
         cfg.repo,
         cfg.tag,
-        cfg.poll_interval.as_secs()
+        cfg.poll_interval.as_secs(),
+        last,
     );
 
+    let mut consecutive_failures: u32 = 0;
     loop {
-        std::thread::sleep(cfg.poll_interval);
+        let sleep_for = if consecutive_failures > 0 {
+            backoff_with_jitter(cfg.poll_interval, consecutive_failures)
+        } else {
+            jittered(cfg.poll_interval)
+        };
+        log::info!(
+            "ota: sleeping {}s (failures={})",
+            sleep_for.as_secs(),
+            consecutive_failures
+        );
+        std::thread::sleep(sleep_for);
         match poll_once(&mut nvs, &cfg) {
-            Ok(PollOutcome::NoChange) => log::info!("ota: no change"),
+            Ok(PollOutcome::NoChange) => {
+                consecutive_failures = 0;
+                log::info!("ota: no change");
+            }
             Ok(PollOutcome::Updated(d)) => {
                 log::info!("ota: applied {}, rebooting in 1s", d);
                 std::thread::sleep(Duration::from_secs(1));
                 unsafe { esp_idf_svc::sys::esp_restart() };
             }
-            Err(e) => log::warn!("ota: poll failed: {:#}", e),
+            Err(e) => {
+                consecutive_failures += 1;
+                log::warn!(
+                    "ota: poll failed (consecutive failures={}): {:#}",
+                    consecutive_failures,
+                    e
+                );
+            }
         }
     }
+}
+
+/// Exponential backoff capped at BACKOFF_CAP, with ±10% jitter applied.
+fn backoff_with_jitter(base: Duration, failures: u32) -> Duration {
+    // 2^10 = 1024x is plenty; the cap will be hit far earlier in practice.
+    let exp = failures.min(10);
+    let multiplied = base.saturating_mul(1u32 << exp);
+    let bounded = multiplied.min(BACKOFF_CAP);
+    jittered(bounded)
+}
+
+/// Apply ±10% jitter using the ESP32's hardware RNG. Used on the success
+/// path too so a fleet doesn't poll in lockstep.
+fn jittered(base: Duration) -> Duration {
+    let r: u32 = unsafe { esp_idf_svc::sys::esp_random() };
+    let pct = (r % 21) as i32 - 10; // -10..=+10
+    let secs = base.as_secs() as i64;
+    let delta = (secs * pct as i64) / 100;
+    let new_secs = (secs + delta).max(1) as u64;
+    Duration::from_secs(new_secs)
 }
 
 enum PollOutcome {
