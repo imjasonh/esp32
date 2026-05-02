@@ -74,3 +74,59 @@ PAT setup) and a real cosign OIDC flow the first time per ~10min window
 — a browser pops to authenticate. CI does this automatically via the
 GitHub Actions workflow's ambient OIDC token.
 
+## Optional: GCP Cloud Logging
+
+The firmware can ship structured `tracing` events (both app and OTA) to
+Google Cloud Logging. Cloud logging is **opt-in per device** — without
+the `[gcp]` block in `provisioning.toml` the device boots normally and
+just emits to serial. Full design in [`logs-plan.md`](logs-plan.md).
+
+One-time GCP setup, using `gcloud`:
+
+```bash
+PROJECT_ID=<YOUR_PROJECT_ID>
+SA_NAME=<YOUR_SA_NAME>
+SA_EMAIL=$SA_NAME@$PROJECT_ID.iam.gserviceaccount.com
+
+# Create the service account.
+gcloud iam service-accounts create $SA_NAME \
+    --display-name="ESP32 device logger" \
+    --project=$PROJECT_ID
+
+# Grant only logging.logWriter — least privilege. The device can write
+# log entries; it cannot read, delete, or do anything else.
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$SA_EMAIL" \
+    --role="roles/logging.logWriter"
+
+# Create + download a JSON key. Keep this file safe — anyone with it
+# can write logs as this SA.
+gcloud iam service-accounts keys create gcp-sa-key.json \
+    --iam-account=$SA_EMAIL \
+    --project=$PROJECT_ID
+
+# Extract the RSA private key PEM and the key id into the forms
+# `tools/provision/` wants.
+jq -j .private_key    gcp-sa-key.json > gcp-sa-key.pem  # -j: no trailing newline
+KEY_ID=$(jq -r .private_key_id gcp-sa-key.json)
+echo "sa_key_id = $KEY_ID"
+```
+
+Then add a `[gcp]` block to `provisioning.toml` (template in
+`provisioning.toml.example`) using `$PROJECT_ID`, `$SA_EMAIL`, the
+printed `KEY_ID`, and the path `gcp-sa-key.pem`. Re-run `make provision`
+and reboot the device.
+
+Logs land in Cloud Logging under
+`projects/kontaindotme/logs/esp32-firmware`. The device's MAC is in
+`resource.labels.node_id` for fleet filtering; the originating tracing
+target is in `jsonPayload.module` so you can split app vs OTA in the
+Cloud Logging UI (e.g.
+`jsonPayload.module = "esp32_blinky::ota"` or
+`= "esp32_blinky::sig"`).
+
+**Threat model**: the SA private key sits in NVS unencrypted. Anyone
+with physical access to the chip can extract it. Mitigation is
+strict scoping (only `roles/logging.logWriter`, only on a
+logs-tolerant project). Real hardening = Flash Encryption + Secure
+Boot v2 (deferred; see [`ota.md`](ota.md) Future work).

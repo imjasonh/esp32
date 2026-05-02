@@ -26,11 +26,11 @@ pio = ["esp-idf-svc/pio"]
 std = ["esp-idf-svc/std"]
 
 [dependencies]
-# `log` feature makes tracing events emit log records too, so EspLogger
-# (which is a log::Logger) picks them up and writes via esp_log_write.
-# No tracing subscriber needed on the device; structured fields render
-# into the message text.
-tracing = { version = "0.1", features = ["log"] }
+# `log-always` makes tracing emit log records even when a Subscriber is
+# set, so EspLogger (a log::Logger) keeps writing to the serial console
+# in addition to whatever subscriber layers we install (cloud_log).
+tracing = { version = "0.1", features = ["log-always"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 anyhow = "1"
 esp-idf-svc = "0.52"
 embedded-svc = "0.29"
@@ -46,6 +46,10 @@ p256 = { version = "0.13", features = ["ecdsa"] }      # leaf signs DSSE
 p384 = { version = "0.13", features = ["ecdsa"] }      # intermediate signs leaf
 x509-cert = { version = "0.2", features = ["pem"] }
 base64 = "0.22"
+# Cloud Logging: RSA-PKCS#1v1.5 SHA-256 signing for service-account JWTs.
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
+# RFC 3339 timestamp formatting for Cloud Logging entries.
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
 
 [build-dependencies]
 embuild = "0.33"

@@ -55,6 +55,8 @@ struct Cli {
 struct ProvisioningConfig {
     wifi: WifiConfig,
     trust: TrustConfig,
+    /// Optional. If absent, the device boots with serial-only logging.
+    gcp: Option<GcpConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -74,6 +76,36 @@ struct TrustConfig {
 struct TrustedIdentity {
     identity: String,
     issuer: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct GcpConfig {
+    project_id: String,
+    sa_email: String,
+    sa_key_id: String,
+    /// Path to a PKCS#8 PEM containing the service account's RSA
+    /// private key. Resolved relative to provisioning.toml's directory.
+    sa_key_pem: PathBuf,
+    /// "trace" / "debug" / "info" / "warn" / "error". Default "info".
+    /// Determines the minimum severity that gets shipped to Cloud
+    /// Logging (everything still goes to serial).
+    #[serde(default = "default_severity")]
+    min_severity: String,
+}
+
+fn default_severity() -> String {
+    "info".to_string()
+}
+
+fn severity_to_u8(s: &str) -> Result<u8> {
+    match s.to_ascii_lowercase().as_str() {
+        "trace" => Ok(0),
+        "debug" => Ok(1),
+        "info" => Ok(2),
+        "warn" => Ok(3),
+        "error" => Ok(4),
+        other => Err(anyhow!("unknown min_severity: {}", other)),
+    }
 }
 
 fn main() -> Result<()> {
@@ -109,10 +141,19 @@ fn main() -> Result<()> {
         cfg.trust.fulcio_intermediate_pem =
             config_dir.join(&cfg.trust.fulcio_intermediate_pem);
     }
+    if let Some(gcp) = cfg.gcp.as_mut() {
+        if gcp.sa_key_pem.is_relative() {
+            gcp.sa_key_pem = config_dir.join(&gcp.sa_key_pem);
+        }
+        // Validate severity now (before writing CSV) so a typo fails
+        // fast with a clear error.
+        severity_to_u8(&gcp.min_severity)?;
+    }
 
     tracing::info!(
         identities = cfg.trust.identities.len(),
         ssid = cfg.wifi.ssid,
+        gcp = cfg.gcp.is_some(),
         "loaded provisioning config",
     );
 
@@ -245,6 +286,24 @@ fn write_csv(
             .to_str()
             .ok_or_else(|| anyhow!("fulcio_intermediate_pem path not UTF-8"))?,
     ])?;
+
+    // gcp namespace (optional)
+    if let Some(gcp) = &cfg.gcp {
+        wtr.write_record(&["gcp", "namespace", "", ""])?;
+        wtr.write_record(&["project_id", "data", "string", &gcp.project_id])?;
+        wtr.write_record(&["sa_email", "data", "string", &gcp.sa_email])?;
+        wtr.write_record(&["sa_key_id", "data", "string", &gcp.sa_key_id])?;
+        wtr.write_record(&[
+            "sa_key_pem",
+            "file",
+            "binary",
+            gcp.sa_key_pem
+                .to_str()
+                .ok_or_else(|| anyhow!("sa_key_pem path not UTF-8"))?,
+        ])?;
+        let severity = severity_to_u8(&gcp.min_severity)?;
+        wtr.write_record(&["min_severity", "data", "u8", &severity.to_string()])?;
+    }
 
     wtr.flush()?;
     Ok(())

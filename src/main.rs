@@ -11,6 +11,7 @@ use esp_idf_svc::wifi::{
 use std::ffi::CStr;
 use std::time::Duration;
 
+mod cloud_log;
 mod ota;
 mod sig;
 mod trust;
@@ -29,8 +30,29 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    // Take NVS as early as possible — needed to decide whether to
+    // install the cloud-log tracing subscriber, *before* any tracing
+    // events fire.
+    let nvs = EspDefaultNvsPartition::take()?;
+    let gcp = cloud_log::GcpConfig::load(nvs.clone())?;
+    let log_queue = if let Some(ref cfg) = gcp {
+        let queue = cloud_log::LogQueue::new(cloud_log::QUEUE_CAPACITY);
+        let layer = cloud_log::CloudLogLayer::new(queue.clone(), cfg.min_severity);
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let _ = tracing_subscriber::registry().with(layer).try_init();
+        Some(queue)
+    } else {
+        None
+    };
+
     log_running_partition();
     tracing::info!(version = FW_VERSION, "booting");
+    if gcp.is_some() {
+        tracing::info!("cloud_log: subscribed");
+    } else {
+        tracing::info!("cloud_log: not configured (no [gcp] in NVS), serial only");
+    }
 
     let pending_verify = ota::is_pending_verify();
     if pending_verify {
@@ -39,10 +61,8 @@ fn main() -> Result<()> {
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
-    let nvs = EspDefaultNvsPartition::take()?;
 
-    // Read all required NVS config up front; strict-inert if anything is
-    // missing. See provisioning-plan.md.
+    // Read remaining NVS config; strict-inert if missing. See ota.md.
     let (ssid, pass) = match read_wifi_creds(nvs.clone())? {
         Some(creds) => creds,
         None => block_unprovisioned("wifi/ssid or wifi/pass missing in NVS"),
@@ -73,6 +93,36 @@ fn main() -> Result<()> {
         "wifi connected",
     );
 
+    // SNTP is only needed for cloud logging — the service-account JWT
+    // auth requires real wall-clock time for `iat`/`exp` (Google rejects
+    // tokens minted from a 1970 clock). Devices without `[gcp]` skip
+    // the wait and boot faster. Cloud Logging entry timestamps
+    // themselves are assigned server-side by GCP if we omit them.
+    let _sntp = if gcp.is_some() {
+        let sntp = esp_idf_svc::sntp::EspSntp::new_default()?;
+        let started = std::time::Instant::now();
+        loop {
+            use esp_idf_svc::sntp::SyncStatus;
+            if sntp.get_sync_status() == SyncStatus::Completed {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ntp: synced",
+                );
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(15) {
+                tracing::warn!(
+                    "ntp: not synced after 15s, cloud logging will fail until clock catches up",
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Some(sntp)
+    } else {
+        None
+    };
+
     fetch("https://api.ipify.org?format=json")?;
     fetch("https://wttr.in/?format=3")?;
 
@@ -96,6 +146,14 @@ fn main() -> Result<()> {
         .stack_size(48 * 1024)
         .spawn(move || ota::run(ota_nvs, FW_VERSION, ota_trust))
         .expect("spawn ota thread");
+
+    if let (Some(cfg), Some(queue)) = (gcp, log_queue) {
+        std::thread::Builder::new()
+            // RSA signing + HTTPS POST. 32 KB matches the OTA loop budget.
+            .stack_size(32 * 1024)
+            .spawn(move || cloud_log::run(cfg, queue))
+            .expect("spawn cloud_log thread");
+    }
 
     tracing::info!("main: idling, OTA loop running in background");
     loop {
