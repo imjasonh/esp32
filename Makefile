@@ -79,12 +79,20 @@ sdkconfig.defaults: sdkconfig.defaults.in partitions.csv
 
 # Idempotent: creates $(PYTHON_SHIM) and (re)points python3 at the current
 # uv-managed 3.12 interpreter. Auto-installs Python 3.12 via uv if missing.
+#
+# Important: nuke any pre-existing shim symlinks first. If the shim dir was
+# restored from a CI cache, the symlinks may target a path that no longer
+# exists on this runner, OR may have been auto-resolved by `uv python find`
+# back to the shim itself (self-reference) producing ELOOP. Recreating
+# from scratch each run avoids both.
 ensure-python-shim:
 	@command -v uv >/dev/null || { echo "ERROR: uv not installed. See notes.txt step 4."; exit 1; }
-	@uv python find 3.12 >/dev/null 2>&1 || uv python install 3.12
 	@mkdir -p $(PYTHON_SHIM)
-	@ln -sf "$$(uv python find 3.12)" $(PYTHON_SHIM)/python3
-	@ln -sf "$$(uv python find 3.12)" $(PYTHON_SHIM)/python
+	@rm -f $(PYTHON_SHIM)/python $(PYTHON_SHIM)/python3
+	@uv python find 3.12 >/dev/null 2>&1 || uv python install 3.12
+	@PY=$$(uv python find 3.12) && \
+	    ln -sf "$$PY" $(PYTHON_SHIM)/python3 && \
+	    ln -sf "$$PY" $(PYTHON_SHIM)/python
 
 flash: build
 	espflash flash --port $(PORT) $(BIN)
