@@ -198,26 +198,69 @@ Deferred (low value, or needs hardware/provisioning we don't have yet):
   from outside we'd need a serial console command, a small HTTP
   endpoint on the device, or a config-as-OCI-artifact channel.
 
-### Phase 4 — keyless cosign + Rekor (future)
+### Phase 4 — keyless cosign signing + on-device verification
 
-- Publisher signs with `cosign sign --identity-token` (keyless via OIDC
-  → Fulcio → Rekor).
-- Cosign stores the signature as a sibling OCI artifact tagged
-  `sha256-<digest>.sig`.
-- Device fetches the `.sig`, parses the cosign payload, verifies ECDSA
-  P-256 signature against the Fulcio cert, checks the Rekor inclusion
-  proof, and validates the OIDC identity claim against an allowlist
-  embedded at compile time.
-- Crates: `p256`, `sha2`, `serde_json`. Investigate `sigstore-rs` for
-  Rekor pieces; may need to port a minimal verifier if its deps
-  conflict with the IDF environment.
+Split into three sub-phases because the full thing is a real subproject.
+
+#### Phase 4a — sign + verify signature, no Rekor
+
+- **Publisher**: `cosign sign` runs after each `make publish` push.
+  Keyless OIDC flow (browser the first time, cached after). Sigs are
+  uploaded to GHCR as a sibling OCI artifact at tag
+  `sha256-<digest>.sig`. One signing per push covers both `:latest`
+  and `:sha-<short>` since they resolve to the same digest.
+- **Trust roots in firmware**: `src/trust.rs` carries:
+  - `TRUSTED_IDENTITIES: &[(&str, &str)]` — allowlist of (email,
+    issuer) tuples. Initial: `[("imjasonh@gmail.com",
+    "https://accounts.google.com")]`. Editing requires source change
+    and USB reflash; OTA cannot change this.
+  - Sigstore root CA cert PEM, `include_str!`'d at build time.
+- **Device verification flow**, before download in `poll_once`:
+  1. Fetch the sig artifact at `sha256-<digest>.sig`.
+  2. Parse its layer's annotations: `dev.cosignproject.cosign/signature`
+     (base64 ECDSA), `dev.sigstore.cosign/certificate` (PEM Fulcio cert
+     chain).
+  3. Fetch the layer payload blob (the JSON to-be-signed).
+  4. Parse the leaf signing cert. Extract the email (SAN
+     rfc822Name) and OIDC issuer (cert extension OID
+     `1.3.6.1.4.1.57264.1.1` legacy or `.1.8` for v2).
+  5. Reject if the (email, issuer) tuple isn't in
+     `TRUSTED_IDENTITIES`.
+  6. Verify the cert chains to the bundled Sigstore root.
+  7. Verify the ECDSA-P256 signature over the payload bytes using
+     the cert's public key.
+  8. Parse the payload JSON (`type:"cosign container image
+     signature"`); confirm `critical.image.docker-manifest-digest`
+     matches the manifest digest we're about to apply.
+  9. Only then proceed with the download/write/reboot.
+- **Defer to phase 4b**: cert-validity-window check needs a trusted
+  timestamp (Rekor SET) to make sense, since Fulcio certs are 10-min
+  short-lived.
+- **Crates added**: `p256` (ECDSA verify), `x509-cert` + `der` (cert
+  parsing), `base64` (annotation decoding), `pem` (PEM block parsing).
+  Roughly +100 KB of firmware.
+
+#### Phase 4b — Rekor SET verification
+
+- Add the Signed Entry Timestamp check from cosign's bundle annotation
+  (or fetched from Rekor directly). Verify SET signed by Rekor's
+  bundled public key. Use the SET timestamp to enforce the cert
+  validity window.
+- Bundle Rekor's public key alongside the Sigstore root.
+
+#### Phase 4c — operational hardening
+
+- Better verification-failure logs (exact field that failed).
+- Support the multiple cosign annotation/bundle formats that exist
+  across cosign versions.
+- Metrics counter for verify-pass / verify-fail / sig-not-found.
 
 ## Order of work
 
-1. Phase 0 (partition table + flash-all). Small, well-scoped.
-2. Phase 1 publisher. Independently testable: push an artifact, pull it
-   with `oras pull`, confirm bytes match.
-3. Phase 2 firmware OTA loop. Highest risk for bricking; this is where
-   layer-1 rollback earns its keep.
-4. Phase 3 polish.
-5. Phase 4 signing as a separate effort.
+1. Phase 0 (partition table + flash-all). ✅
+2. Phase 1 publisher. ✅
+3. Phase 2 firmware OTA loop. ✅
+4. Phase 3 polish. ✅ (partial; some deferred)
+5. Phase 4a signing + verify (no Rekor).
+6. Phase 4b Rekor SET verification.
+7. Phase 4c operational hardening.

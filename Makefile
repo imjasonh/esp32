@@ -123,6 +123,9 @@ publish: $(FW_BIN) check-gh-env
 	    --bin $(CURDIR)/$(FW_BIN) \
 	    --repo $(OCI_REPO) \
 	    --git-sha $(GIT_SHA)
+	@echo ">>> Signing $(OCI_REPO):latest with cosign (keyless OIDC)"
+	. ./gh.env && COSIGN_REGISTRY_USERNAME=imjasonh COSIGN_REGISTRY_PASSWORD="$$GH_TOKEN" \
+	    cosign sign --yes $(OCI_REPO):latest
 
 # Pull the latest artifact from OCI_REPO and verify its layer SHA matches
 # our locally-built firmware. Confirms the round trip works and exercises

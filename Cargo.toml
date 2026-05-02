@@ -33,6 +33,11 @@ embedded-svc = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+# Phase 4a: cosign Sigstore Bundle verification.
+p256 = { version = "0.13", features = ["ecdsa"] }      # leaf signs DSSE
+p384 = { version = "0.13", features = ["ecdsa"] }      # intermediate signs leaf
+x509-cert = { version = "0.2", features = ["pem"] }
+base64 = "0.22"
 
 [build-dependencies]
 embuild = "0.33"

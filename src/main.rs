@@ -12,6 +12,8 @@ use std::ffi::CStr;
 use std::time::Duration;
 
 mod ota;
+mod sig;
+mod trust;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASS: &str = env!("WIFI_PASS");
@@ -66,10 +68,10 @@ fn main() -> Result<()> {
 
     let ota_nvs = nvs.clone();
     std::thread::Builder::new()
-        // OTA work is HTTPS + JSON parse + SHA256 on a streaming download;
-        // mbedtls alone wants several KB. 32 KB has headroom; observed
-        // failures at 8 KB.
-        .stack_size(32 * 1024)
+        // HTTPS + JSON + SHA256 is ~32 KB; phase 4a adds X.509 parsing
+        // and ECDSA P-256/P-384 verification on top, which want more.
+        // 48 KB is observed-safe with headroom.
+        .stack_size(48 * 1024)
         .spawn(move || ota::run(ota_nvs, FW_VERSION))
         .expect("spawn ota thread");
 

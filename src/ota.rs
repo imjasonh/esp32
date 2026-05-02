@@ -132,9 +132,11 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
             }
             Err(e) => {
                 consecutive_failures += 1;
+                // {:#} renders the anyhow chain on one line:
+                //   "outer: middle: root cause"
                 tracing::warn!(
                     failures = consecutive_failures,
-                    error = %e,
+                    error = %format!("{:#}", e),
                     "ota: poll failed",
                 );
             }
@@ -170,11 +172,9 @@ enum PollOutcome {
 fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcome> {
     let token = fetch_anon_token(&cfg.repo)?;
 
-    // Manifest fetch. We re-fetch every poll (no If-None-Match yet — the
-    // ESP HTTP client doesn't make that trivial); we do compare the layer
-    // digest from the manifest against last_applied_digest before
-    // downloading the (much larger) layer.
-    let manifest = fetch_manifest(&cfg.repo, &cfg.tag, &token)?;
+    // Fetch manifest and compute its SHA256 — that's the manifest digest
+    // cosign signed (and that we'll need for the bundle lookup).
+    let (manifest, manifest_digest_hex) = fetch_manifest(&cfg.repo, &cfg.tag, &token)?;
     let layer = manifest
         .layers
         .into_iter()
@@ -184,9 +184,10 @@ fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcom
         bail!("unexpected layer mediaType: {}", layer.media_type);
     }
     tracing::info!(
-        digest = %layer.digest,
+        manifest_digest = %format!("sha256:{}", manifest_digest_hex),
+        layer_digest = %layer.digest,
         size = layer.size,
-        "ota: manifest layer",
+        "ota: manifest",
     );
 
     let last = read_string(nvs, NVS_LAST_DIGEST).unwrap_or_default();
@@ -196,8 +197,16 @@ fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcom
     tracing::info!(
         previous = %if last.is_empty() { "<none>" } else { &last },
         new = %layer.digest,
-        "ota: new digest, downloading",
+        "ota: new digest, verifying signature before download",
     );
+
+    // Phase 4a: fetch and verify the cosign signature bundle BEFORE the
+    // (much larger) firmware download. Refuses unknown signers.
+    let bundle = fetch_signature_bundle(&cfg.repo, &manifest_digest_hex, &token)
+        .context("fetch signature bundle")?;
+    crate::sig::verify_bundle(&bundle, &manifest_digest_hex)
+        .context("verify signature bundle")?;
+    tracing::info!("ota: signature verified, proceeding with download");
 
     download_and_apply(&cfg.repo, &layer, &token)?;
 
@@ -224,7 +233,9 @@ fn fetch_anon_token(repo: &str) -> Result<String> {
     Ok(resp.token)
 }
 
-fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<Manifest> {
+/// Returns the parsed manifest plus the hex SHA256 of the manifest bytes
+/// (the canonical digest that cosign signed).
+fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<(Manifest, String)> {
     let repo_path = repo
         .strip_prefix("ghcr.io/")
         .ok_or_else(|| anyhow!("only ghcr.io is supported for now (got {})", repo))?;
@@ -243,9 +254,107 @@ fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<Manifest> {
         ],
         &mut buf,
     )?;
+    let digest_hex = format!("{:x}", Sha256::digest(&buf));
     let m: Manifest = serde_json::from_slice(&buf)
         .with_context(|| format!("parse manifest JSON ({} bytes)", buf.len()))?;
-    Ok(m)
+    Ok((m, digest_hex))
+}
+
+/// Fetch the cosign Sigstore bundle for the artifact at the given
+/// manifest digest. Walks the OCI 1.1 referrers layout cosign uses:
+/// the bundle artifact lives at tag `sha256-<hex>` and is an image
+/// index → inner manifest → bundle layer blob.
+fn fetch_signature_bundle(
+    repo: &str,
+    manifest_digest_hex: &str,
+    token: &str,
+) -> Result<Vec<u8>> {
+    let repo_path = repo
+        .strip_prefix("ghcr.io/")
+        .ok_or_else(|| anyhow!("only ghcr.io is supported"))?;
+    let auth = format!("Bearer {}", token);
+    let bundle_tag = format!("sha256-{}", manifest_digest_hex);
+
+    // 1. Outer index
+    let url1 = format!("https://ghcr.io/v2/{}/manifests/{}", repo_path, bundle_tag);
+    let mut buf1 = Vec::with_capacity(1024);
+    fetch_to_buf(
+        &url1,
+        &[
+            ("authorization", auth.as_str()),
+            (
+                "accept",
+                "application/vnd.oci.image.index.v1+json,application/vnd.oci.image.manifest.v1+json",
+            ),
+        ],
+        &mut buf1,
+    )
+    .context("fetch sig outer manifest/index")?;
+
+    #[derive(Deserialize)]
+    struct Index {
+        manifests: Vec<IndexEntry>,
+    }
+    #[derive(Deserialize)]
+    struct IndexEntry {
+        digest: String,
+    }
+    let inner_digest = if let Ok(idx) = serde_json::from_slice::<Index>(&buf1) {
+        idx.manifests
+            .first()
+            .ok_or_else(|| anyhow!("sig index has no manifests"))?
+            .digest
+            .clone()
+    } else {
+        // Fallback: outer is already the manifest itself
+        let m: Manifest = serde_json::from_slice(&buf1)
+            .context("sig outer is neither index nor manifest")?;
+        return blob_for_sigstore_bundle(&m, repo_path, &auth);
+    };
+
+    // 2. Inner manifest
+    let url2 = format!("https://ghcr.io/v2/{}/manifests/{}", repo_path, inner_digest);
+    let mut buf2 = Vec::with_capacity(2048);
+    fetch_to_buf(
+        &url2,
+        &[
+            ("authorization", auth.as_str()),
+            (
+                "accept",
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+        ],
+        &mut buf2,
+    )
+    .context("fetch sig inner manifest")?;
+    let inner: Manifest =
+        serde_json::from_slice(&buf2).context("parse sig inner manifest JSON")?;
+
+    blob_for_sigstore_bundle(&inner, repo_path, &auth)
+}
+
+fn blob_for_sigstore_bundle(
+    m: &Manifest,
+    repo_path: &str,
+    auth: &str,
+) -> Result<Vec<u8>> {
+    let layer = m
+        .layers
+        .iter()
+        .find(|l| l.media_type.starts_with("application/vnd.dev.sigstore.bundle."))
+        .ok_or_else(|| anyhow!("sig manifest has no Sigstore bundle layer"))?;
+    let url = format!("https://ghcr.io/v2/{}/blobs/{}", repo_path, layer.digest);
+    let mut buf = Vec::with_capacity(layer.size as usize + 256);
+    fetch_to_buf(
+        &url,
+        &[
+            ("authorization", auth),
+            ("accept", "application/octet-stream"),
+        ],
+        &mut buf,
+    )
+    .context("fetch sig bundle blob")?;
+    Ok(buf)
 }
 
 fn fetch_to_buf(url: &str, headers: &[(&str, &str)], buf: &mut Vec<u8>) -> Result<()> {
