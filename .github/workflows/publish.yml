@@ -46,7 +46,7 @@ jobs:
           ldproxy: true
 
       - name: Install espflash
-        run: cargo install espflash@3 --locked
+        run: cargo install espflash --locked
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
