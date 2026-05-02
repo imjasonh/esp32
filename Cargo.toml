@@ -1,0 +1,31 @@
+[package]
+name = "esp32-blinky"
+version = "0.1.0"
+edition = "2021"
+resolver = "2"
+rust-version = "1.77"
+
+[[bin]]
+name = "esp32-blinky"
+harness = false
+
+[profile.release]
+opt-level = "s"
+
+[profile.dev]
+debug = true
+opt-level = "z"
+
+[features]
+default = ["std", "esp-idf-svc/native", "esp-idf-svc/binstart"]
+pio = ["esp-idf-svc/pio"]
+std = ["esp-idf-svc/std"]
+
+[dependencies]
+log = "0.4"
+anyhow = "1"
+esp-idf-svc = "0.51"
+embedded-svc = "0.28"
+
+[build-dependencies]
+embuild = "0.33"
