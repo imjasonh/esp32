@@ -1,0 +1,32 @@
+# Weekly dep bumps, grouped per ecosystem so we get one PR per category
+# (one for GHA action versions, one for firmware Cargo deps, one for the
+# publisher Cargo deps) instead of N PRs per week.
+
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      gha:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      firmware:
+        patterns:
+          - "*"
+
+  - package-ecosystem: cargo
+    directory: /tools/publisher
+    schedule:
+      interval: weekly
+    groups:
+      publisher:
+        patterns:
+          - "*"
