@@ -74,12 +74,18 @@ PAT setup) and a real cosign OIDC flow the first time per ~10min window
 — a browser pops to authenticate. CI does this automatically via the
 GitHub Actions workflow's ambient OIDC token.
 
-## Optional: GCP Cloud Logging
+## Optional: GCP Cloud Logging + Monitoring
 
 The firmware can ship structured `tracing` events (both app and OTA) to
-Google Cloud Logging. Cloud logging is **opt-in per device** — without
-the `[gcp]` block in `provisioning.toml` the device boots normally and
-just emits to serial. Full design in [`logs-plan.md`](logs-plan.md).
+Google Cloud Logging *and* periodic chip-health metrics (heap, stack,
+wifi, cpu, uptime, …) to Cloud Monitoring. Both are **opt-in per
+device** — without the `[gcp]` block in `provisioning.toml` the device
+boots normally and just emits to serial. Full design in
+[`logs-plan.md`](logs-plan.md) and [`monitoring-plan.md`](monitoring-plan.md).
+
+One service account and one key cover both APIs (the JWT requests
+both scopes; one cached access token is shared by the cloud_log and
+metrics threads).
 
 One-time GCP setup, using `gcloud`:
 
@@ -93,14 +99,18 @@ gcloud iam service-accounts create $SA_NAME \
     --display-name="ESP32 device logger" \
     --project=$PROJECT_ID
 
-# Grant only logging.logWriter — least privilege. The device can write
-# log entries; it cannot read, delete, or do anything else.
+# Grant only logging.logWriter + monitoring.metricWriter — least
+# privilege. The device can write log entries and metric points;
+# it cannot read, delete, or do anything else.
 gcloud projects add-iam-policy-binding $PROJECT_ID \
     --member="serviceAccount:$SA_EMAIL" \
     --role="roles/logging.logWriter"
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+    --member="serviceAccount:$SA_EMAIL" \
+    --role="roles/monitoring.metricWriter"
 
 # Create + download a JSON key. Keep this file safe — anyone with it
-# can write logs as this SA.
+# can write logs + metrics as this SA.
 gcloud iam service-accounts keys create gcp-sa-key.json \
     --iam-account=$SA_EMAIL \
     --project=$PROJECT_ID
@@ -124,6 +134,19 @@ target is in `jsonPayload.module` so you can split app vs OTA in the
 Cloud Logging UI (e.g.
 `jsonPayload.module = "esp32_blinky::ota"` or
 `= "esp32_blinky::sig"`).
+
+Metrics land under `custom.googleapis.com/esp32/<name>` (e.g.
+`free_heap`, `wifi_rssi`, `stack_hwm` with a `task` label). Snapshot
+cadence is `metrics_interval_secs` in the `[gcp]` block (default 300s,
+0 disables — cloud_log keeps running). Inspect with:
+
+```bash
+gcloud monitoring time-series list \
+    --filter='metric.type=starts_with("custom.googleapis.com/esp32/")' \
+    --interval-end-time=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
+    --interval-start-time=$(date -u -v-30M +%Y-%m-%dT%H:%M:%SZ) \
+    --project=$PROJECT_ID
+```
 
 **Threat model**: the SA private key sits in NVS unencrypted. Anyone
 with physical access to the chip can extract it. Mitigation is

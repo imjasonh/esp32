@@ -1,28 +1,19 @@
 //! Ship structured logs from the device to Google Cloud Logging.
 //!
-//! Implementation in stages:
-//! - This commit: NVS-loaded config, tracing layer that captures events
-//!   into a bounded ring buffer, background sender task that *would*
-//!   POST batches but currently just writes them to serial as a stub.
-//! - Next commit: real POST via NTP-synced timestamps + service-account
-//!   JWT auth + the Cloud Logging REST API.
+//! - `CloudLogLayer` is a `tracing_subscriber::Layer` that captures
+//!   events into a bounded ring buffer.
+//! - `run()` is a background sender thread that drains the buffer and
+//!   POSTs batches to `logging.googleapis.com/v2/entries:write` using
+//!   a Bearer token from `gcp_auth::TokenProvider` (shared with
+//!   `metrics`).
 //!
 //! Cloud logging is opt-in per device. If the `gcp` NVS namespace is
 //! missing required keys (`project_id`, `sa_email`, `sa_key_id`,
 //! `sa_key_pem`), the firmware boots normally with serial-only logs.
 
-use anyhow::{anyhow, bail, Context, Result};
-use base64::Engine;
-use embedded_svc::http::client::Client;
-use embedded_svc::io::Write as _;
-use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection, FollowRedirectsPolicy};
-use esp_idf_svc::http::Method;
+use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
-use rsa::pkcs1v15::SigningKey;
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::signature::{SignatureEncoding, Signer};
-use rsa::RsaPrivateKey;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,12 +21,17 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context as LayerContext;
 use tracing_subscriber::Layer;
 
+use crate::gcp_auth::{device_mac, http_post, now_unix_secs, unix_to_rfc3339, TokenProvider};
+
 const NVS_GCP_NS: &str = "gcp";
 const NVS_PROJECT_ID: &str = "project_id";
 const NVS_SA_EMAIL: &str = "sa_email";
 const NVS_SA_KEY_ID: &str = "sa_key_id";
 const NVS_SA_KEY_PEM: &str = "sa_key_pem";
 const NVS_MIN_SEVERITY: &str = "min_severity";
+// 15-char NVS key limit forces the abbreviation; the toml field stays
+// readable as `metrics_interval_secs`.
+const NVS_METRICS_INTERVAL_SECS: &str = "metric_intvl";
 
 /// Capacity of the in-RAM log queue. When the queue is full, oldest
 /// entries are dropped and counted; the count surfaces as
@@ -44,7 +40,11 @@ pub const QUEUE_CAPACITY: usize = 256;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 const BATCH_MAX_ENTRIES: usize = 50;
 
-/// GCP-side config + opt-in flag, read from NVS at boot.
+/// Default snapshot cadence if `metrics_interval` is absent in NVS.
+pub const DEFAULT_METRICS_INTERVAL_SECS: u32 = 300;
+
+/// GCP-side config + opt-in flag, read from NVS at boot. Shared by
+/// `cloud_log` (logs) and `metrics` (Cloud Monitoring time series).
 #[derive(Clone)]
 pub struct GcpConfig {
     pub project_id: String,
@@ -52,6 +52,8 @@ pub struct GcpConfig {
     pub sa_key_id: String,
     pub sa_key_pem: Vec<u8>,
     pub min_severity: Level,
+    /// 0 = metrics disabled (cloud_log still runs); >0 = sample period.
+    pub metrics_interval_secs: u32,
 }
 
 impl GcpConfig {
@@ -86,6 +88,11 @@ impl GcpConfig {
                 sa_key_id: k,
                 sa_key_pem: pem,
                 min_severity: read_severity(&nvs),
+                metrics_interval_secs: nvs
+                    .get_u32(NVS_METRICS_INTERVAL_SECS)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(DEFAULT_METRICS_INTERVAL_SECS),
             })),
             _ => Ok(None),
         }
@@ -153,6 +160,8 @@ struct QueueInner {
     deque: VecDeque<LogEntry>,
     capacity: usize,
     pending_dropped: u32,
+    /// Lifetime drop count (for the metrics path; never reset).
+    dropped_total: u64,
 }
 
 impl LogQueue {
@@ -162,6 +171,7 @@ impl LogQueue {
                 deque: VecDeque::with_capacity(capacity),
                 capacity,
                 pending_dropped: 0,
+                dropped_total: 0,
             })),
         }
     }
@@ -180,6 +190,7 @@ impl LogQueue {
         if g.deque.len() == g.capacity {
             g.deque.pop_front();
             g.pending_dropped = g.pending_dropped.saturating_add(1);
+            g.dropped_total = g.dropped_total.saturating_add(1);
         }
         g.deque.push_back(entry);
     }
@@ -192,6 +203,14 @@ impl LogQueue {
         };
         let n = g.deque.len().min(max);
         g.deque.drain(..n).collect()
+    }
+
+    /// Current queue depth + lifetime drop count, for the metrics path.
+    pub fn stats(&self) -> (usize, u64) {
+        match self.inner.lock() {
+            Ok(g) => (g.deque.len(), g.dropped_total),
+            Err(_) => (0, 0),
+        }
     }
 }
 
@@ -209,11 +228,15 @@ impl CloudLogLayer {
 
 impl<S: Subscriber> Layer<S> for CloudLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
-        // Skip events emitted by this module itself, otherwise the
-        // sender's "post failed" / "token refreshed" tracing calls
-        // get pushed onto the queue it's draining, creating a tight
-        // feedback loop. Cloud_log's own messages stay serial-only.
-        if event.metadata().target() == module_path!() {
+        // Skip events emitted by the modules that drive the cloud
+        // pipeline themselves — otherwise their tracing calls land on
+        // the queue they're draining (or that the metrics POST path
+        // uses) and create a tight feedback loop.
+        let target = event.metadata().target();
+        if target == module_path!()
+            || target == "esp32_blinky::gcp_auth"
+            || target == "esp32_blinky::metrics"
+        {
             return;
         }
         let level = *event.metadata().level();
@@ -228,26 +251,12 @@ impl<S: Subscriber> Layer<S> for CloudLogLayer {
         let entry = LogEntry {
             timestamp_unix_secs: now_unix_secs(),
             severity: level,
-            target: event.metadata().target().to_string(),
+            target: target.to_string(),
             message: visitor.message,
             fields: visitor.fields,
             dropped_before: 0,
         };
         self.queue.push(entry);
-    }
-}
-
-/// Wall-clock time in UNIX seconds, or None if the system clock is
-/// still at the ESP-IDF default epoch (1970). NTP sync hasn't happened
-/// yet → return None and let Cloud Logging assign server-side time.
-fn now_unix_secs() -> Option<u64> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
-    // Anything before 2020-01-01 means NTP hasn't synced yet.
-    if secs < 1_577_836_800 {
-        None
-    } else {
-        Some(secs)
     }
 }
 
@@ -306,13 +315,10 @@ impl FieldCapture {
 }
 
 /// Sender thread main loop. Drains the queue every `FLUSH_INTERVAL`,
-/// mints/refreshes a service-account access token as needed, and
-/// POSTs batches to Cloud Logging.
-///
-/// Uses tracing internally — the `module_path!()` filter in
-/// `CloudLogLayer::on_event` keeps cloud_log's own messages out of
-/// the queue (no feedback loop).
-pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
+/// pulls the bearer from the shared `TokenProvider`, and POSTs batches
+/// to Cloud Logging.
+pub fn run(cfg: GcpConfig, auth: Arc<TokenProvider>, queue: LogQueue) -> ! {
+    crate::metrics::publish_self(&crate::metrics::handles::CLOUD_LOG);
     tracing::info!(
         project = %cfg.project_id,
         sa = %cfg.sa_email,
@@ -320,27 +326,10 @@ pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
         "cloud_log: sender starting",
     );
 
-    // Parse the SA private key once at startup; if it's malformed
-    // we can't do anything useful and log loudly forever.
-    let signing_key = match parse_signing_key(&cfg.sa_key_pem) {
-        Ok(k) => k,
-        Err(e) => {
-            loop {
-                tracing::error!(
-                    error = %format!("{:#}", e),
-                    "cloud_log: SA key parse failed; sender disabled",
-                );
-                std::thread::sleep(Duration::from_secs(300));
-            }
-        }
-    };
-
     let mac = device_mac();
     let log_name = format!("projects/{}/logs/esp32-firmware", cfg.project_id);
 
-    let mut token: Option<CachedToken> = None;
     let mut consecutive_failures: u32 = 0;
-
     loop {
         let sleep_for = if consecutive_failures > 0 {
             // Exponential backoff capped at 5 min for cloud-logging
@@ -358,29 +347,20 @@ pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
             continue;
         }
 
-        if token.as_ref().map_or(true, |t| t.expired_or_close()) {
-            match mint_access_token(&cfg, &signing_key) {
-                Ok(t) => {
-                    tracing::debug!(
-                        expires_in_secs = t.expires_at_unix.saturating_sub(now_unix_secs().unwrap_or(0)),
-                        "cloud_log: minted new access token",
-                    );
-                    token = Some(t);
-                }
-                Err(e) => {
-                    consecutive_failures = consecutive_failures.saturating_add(1);
-                    tracing::warn!(
-                        failures = consecutive_failures,
-                        error = %format!("{:#}", e),
-                        "cloud_log: token mint failed",
-                    );
-                    continue;
-                }
+        let bearer = match auth.get_or_refresh() {
+            Ok(b) => b,
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    failures = consecutive_failures,
+                    error = %format!("{:#}", e),
+                    "cloud_log: token mint failed",
+                );
+                continue;
             }
-        }
+        };
 
-        let bearer = &token.as_ref().unwrap().token;
-        match post_batch(&log_name, &cfg.project_id, &mac, bearer, &batch) {
+        match post_batch(&log_name, &cfg.project_id, &mac, &bearer, &batch) {
             Ok(()) => {
                 tracing::debug!(
                     entries = batch.len(),
@@ -403,101 +383,6 @@ pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
             }
         }
     }
-}
-
-struct CachedToken {
-    token: String,
-    expires_at_unix: u64,
-}
-
-impl CachedToken {
-    fn expired_or_close(&self) -> bool {
-        // Refresh 5 minutes before expiry to avoid races.
-        match now_unix_secs() {
-            Some(now) => now + 300 >= self.expires_at_unix,
-            None => true,
-        }
-    }
-}
-
-fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<rsa::sha2::Sha256>> {
-    // Trim trailing whitespace — jq -r adds a final newline on top of
-    // the PEM's own trailing newline, and pem-rfc7468 then tries to
-    // parse a second (empty) block and errors at "pre-encapsulation
-    // boundary". Tolerate both forms.
-    let pem_str = std::str::from_utf8(pem_bytes)
-        .context("SA key PEM is not UTF-8")?
-        .trim();
-    let key = RsaPrivateKey::from_pkcs8_pem(pem_str).context("parse SA PKCS#8 private key")?;
-    Ok(SigningKey::<rsa::sha2::Sha256>::new(key))
-}
-
-#[derive(Serialize)]
-struct JwtHeader<'a> {
-    alg: &'static str,
-    typ: &'static str,
-    kid: &'a str,
-}
-
-#[derive(Serialize)]
-struct JwtClaims<'a> {
-    iss: &'a str,
-    scope: &'static str,
-    aud: &'static str,
-    iat: u64,
-    exp: u64,
-}
-
-#[derive(Deserialize)]
-struct TokenResp {
-    access_token: String,
-    expires_in: u64,
-}
-
-fn mint_access_token(
-    cfg: &GcpConfig,
-    signing_key: &SigningKey<rsa::sha2::Sha256>,
-) -> Result<CachedToken> {
-    let now = now_unix_secs().ok_or_else(|| anyhow!("NTP not synced; cannot mint JWT"))?;
-
-    let header = JwtHeader {
-        alg: "RS256",
-        typ: "JWT",
-        kid: &cfg.sa_key_id,
-    };
-    let claims = JwtClaims {
-        iss: &cfg.sa_email,
-        scope: "https://www.googleapis.com/auth/logging.write",
-        aud: "https://oauth2.googleapis.com/token",
-        iat: now,
-        exp: now + 3600,
-    };
-
-    let header_b64 = b64url(&serde_json::to_vec(&header)?);
-    let claims_b64 = b64url(&serde_json::to_vec(&claims)?);
-    let signing_input = format!("{}.{}", header_b64, claims_b64);
-    let sig = signing_key.sign(signing_input.as_bytes());
-    let sig_b64 = b64url(sig.to_bytes().as_ref());
-    let jwt = format!("{}.{}", signing_input, sig_b64);
-
-    let body = format!(
-        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={}",
-        jwt
-    );
-    let resp_bytes = http_post(
-        "https://oauth2.googleapis.com/token",
-        "application/x-www-form-urlencoded",
-        body.as_bytes(),
-        None,
-    )
-    .context("POST oauth2/token")?;
-    let resp: TokenResp = serde_json::from_slice(&resp_bytes)
-        .context("parse token response JSON")?;
-
-    Ok(CachedToken {
-        token: resp.access_token,
-        expires_at_unix: now + resp.expires_in,
-    })
 }
 
 #[derive(Serialize)]
@@ -547,7 +432,6 @@ fn post_batch(
             timestamp: e.timestamp_unix_secs.and_then(unix_to_rfc3339),
         })
         .collect();
-    let _ = (project_id, mac); // used inline in MonitoredResource below
 
     let req = WriteEntriesRequest {
         log_name,
@@ -602,83 +486,4 @@ fn build_payload(e: &LogEntry) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(map)
-}
-
-fn unix_to_rfc3339(secs: u64) -> Option<String> {
-    use time::format_description::well_known::Rfc3339;
-    use time::OffsetDateTime;
-    OffsetDateTime::from_unix_timestamp(secs as i64)
-        .ok()
-        .and_then(|dt| dt.format(&Rfc3339).ok())
-}
-
-fn b64url(input: &[u8]) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
-}
-
-/// Single helper for HTTPS POST. Returns the response body bytes.
-/// Errors on any non-2xx status with the body included for diagnosis.
-fn http_post(
-    url: &str,
-    content_type: &str,
-    body: &[u8],
-    bearer: Option<&str>,
-) -> Result<Vec<u8>> {
-    let conn = EspHttpConnection::new(&HttpConfig {
-        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
-        follow_redirects_policy: FollowRedirectsPolicy::FollowAll,
-        timeout: Some(Duration::from_secs(30)),
-        buffer_size: Some(2048),
-        buffer_size_tx: Some(4096),
-        ..Default::default()
-    })?;
-    let mut client = Client::wrap(conn);
-    let body_len = body.len().to_string();
-    let mut headers: Vec<(&str, &str)> = vec![
-        ("content-type", content_type),
-        ("content-length", body_len.as_str()),
-        ("accept", "application/json"),
-    ];
-    if let Some(b) = bearer {
-        headers.push(("authorization", b));
-    }
-    let mut req = client.request(Method::Post, url, &headers)?;
-    req.write_all(body).context("write request body")?;
-    req.flush().ok();
-    let mut resp = req.submit()?;
-    let status = resp.status();
-    let mut buf = Vec::with_capacity(1024);
-    let mut chunk = [0u8; 1024];
-    loop {
-        let n = resp.read(&mut chunk).context("read response chunk")?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    if !(200..300).contains(&status) {
-        bail!(
-            "POST {} -> HTTP {} body={}",
-            url,
-            status,
-            String::from_utf8_lossy(&buf)
-        );
-    }
-    Ok(buf)
-}
-
-/// MAC address as a `aabbccddeeff` hex string. Used as the `node_id`
-/// label on Cloud Logging entries to identify which device the log
-/// came from.
-fn device_mac() -> String {
-    let mut mac = [0u8; 8];
-    unsafe {
-        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
-    }
-    let mut s = String::with_capacity(12);
-    for b in &mac[..6] {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
 }

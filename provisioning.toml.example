@@ -30,7 +30,8 @@ issuer = "https://token.actions.githubusercontent.com"
 
 # Optional. If absent, the device boots with serial-only logging and
 # never tries to talk to GCP. Uncomment + fill in to enable shipping
-# tracing events (app + OTA) to Google Cloud Logging.
+# tracing events (app + OTA) to Google Cloud Logging and chip-health
+# metrics (heap, stack, wifi, cpu, uptime, …) to Cloud Monitoring.
 #
 # [gcp]
 # project_id = "my-logs-project"
@@ -38,3 +39,4 @@ issuer = "https://token.actions.githubusercontent.com"
 # sa_key_id = "abc123..."           # the `private_key_id` field from the SA JSON key
 # sa_key_pem = "gcp-sa-key.pem"     # path to the PKCS#8 RSA private key PEM
 # min_severity = "info"             # trace / debug / info / warn / error
+# metrics_interval_secs = 300       # 0 = metrics off (logs still ship); default 300

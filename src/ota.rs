@@ -91,6 +91,7 @@ pub fn run(
     fw_version: &str,
     trust: crate::trust::TrustConfig,
 ) -> ! {
+    crate::metrics::publish_self(&crate::metrics::handles::OTA);
     let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
         Ok(n) => n,
         Err(e) => {

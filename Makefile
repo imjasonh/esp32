@@ -102,8 +102,12 @@ ensure-python-shim:
 	    ln -sf "$$PY" $(PYTHON_SHIM)/python3 && \
 	    ln -sf "$$PY" $(PYTHON_SHIM)/python
 
+# Pass --partition-table on every flash, even app-only. Without it,
+# espflash 4.x writes a *default* (factory-only) partition table over
+# our OTA layout — silently bricking OTA on the device. Re-passing
+# partitions.csv is a no-op when it already matches what's on flash.
 flash: build
-	espflash flash --port $(PORT) $(BIN)
+	espflash flash --port $(PORT) --partition-table partitions.csv $(BIN)
 
 # Full reflash: erase entire flash, then write bootloader + partition table
 # + app. Use this when the partition table changes, or as the recovery
@@ -124,7 +128,7 @@ monitor:
 	espflash monitor --port $(PORT) $(if $(MAKE_TERMOUT),,--non-interactive)
 
 run: build
-	espflash flash --port $(PORT) --monitor $(BIN)
+	espflash flash --port $(PORT) --partition-table partitions.csv --monitor $(BIN)
 
 clean:
 	cargo clean

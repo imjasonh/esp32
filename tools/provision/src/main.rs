@@ -91,10 +91,18 @@ struct GcpConfig {
     /// Logging (everything still goes to serial).
     #[serde(default = "default_severity")]
     min_severity: String,
+    /// Seconds between Cloud Monitoring metric snapshots. Default 300
+    /// (5 min). 0 = metrics disabled (cloud_log still runs).
+    #[serde(default = "default_metrics_interval")]
+    metrics_interval_secs: u32,
 }
 
 fn default_severity() -> String {
     "info".to_string()
+}
+
+fn default_metrics_interval() -> u32 {
+    300
 }
 
 fn severity_to_u8(s: &str) -> Result<u8> {
@@ -303,6 +311,12 @@ fn write_csv(
         ])?;
         let severity = severity_to_u8(&gcp.min_severity)?;
         wtr.write_record(&["min_severity", "data", "u8", &severity.to_string()])?;
+        wtr.write_record(&[
+            "metric_intvl",
+            "data",
+            "u32",
+            &gcp.metrics_interval_secs.to_string(),
+        ])?;
     }
 
     wtr.flush()?;
