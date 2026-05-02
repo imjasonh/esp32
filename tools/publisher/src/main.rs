@@ -120,7 +120,7 @@ async fn pull_verify(args: PullVerifyArgs) -> Result<()> {
     let local = tokio::fs::read(&args.bin)
         .await
         .with_context(|| format!("read {}", args.bin.display()))?;
-    let local_sha = format!("{:x}", Sha256::digest(&local));
+    let local_sha = hex::encode(Sha256::digest(&local));
     tracing::info!(
         path = %args.bin.display(),
         bytes = local.len(),
@@ -171,7 +171,7 @@ async fn pull_verify(args: PullVerifyArgs) -> Result<()> {
         .await
         .with_context(|| format!("fetch layer blob {}", layer_descriptor.digest))?;
 
-    let pulled_sha = format!("{:x}", Sha256::digest(&layer_bytes));
+    let pulled_sha = hex::encode(Sha256::digest(&layer_bytes));
     let descriptor_sha = layer_descriptor.digest.strip_prefix("sha256:").unwrap_or("");
     if pulled_sha != descriptor_sha {
         return Err(anyhow!(
@@ -198,7 +198,7 @@ async fn push(args: PushArgs) -> Result<()> {
         .await
         .with_context(|| format!("read {}", args.bin.display()))?;
     let bin_size = bin_bytes.len() as u64;
-    let bin_sha256 = format!("{:x}", Sha256::digest(&bin_bytes));
+    let bin_sha256 = hex::encode(Sha256::digest(&bin_bytes));
     tracing::info!(
         path = %args.bin.display(),
         bytes = bin_size,
@@ -314,14 +314,14 @@ fn build_manifest(
 ) -> Result<OciImageManifest> {
     let config_descriptor = OciDescriptor {
         media_type: config.media_type.clone(),
-        digest: format!("sha256:{:x}", Sha256::digest(&config.data)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&config.data))),
         size: config.data.len() as i64,
         urls: None,
         annotations: None,
     };
     let layer_descriptor = OciDescriptor {
         media_type: layer.media_type.clone(),
-        digest: format!("sha256:{:x}", Sha256::digest(&layer.data)),
+        digest: format!("sha256:{}", hex::encode(Sha256::digest(&layer.data))),
         size: layer.data.len() as i64,
         urls: None,
         annotations: None,
