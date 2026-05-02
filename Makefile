@@ -20,6 +20,11 @@ FW_BIN := target/firmware.bin
 # OCI artifact destination.
 OCI_REPO ?= ghcr.io/imjasonh/esp32
 
+# Username for cosign's registry auth (its own auth, separate from the
+# OIDC identity used to sign). Override with COSIGN_REGISTRY_USERNAME=...
+# in CI to use the workflow's actor.
+COSIGN_REGISTRY_USERNAME ?= imjasonh
+
 # Short git SHA, baked into the firmware via env!() (see build.rs + main.rs)
 # and used as the secondary OCI tag on publish.
 GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
@@ -119,13 +124,16 @@ $(FW_BIN): build
 # Build firmware -> save-image -> push OCI artifact to OCI_REPO. Tags
 # pushed: :latest and :sha-<short>. Requires GH_TOKEN in gh.env.
 publish: $(FW_BIN) check-gh-env
-	. ./gh.env && cd tools/publisher && cargo run --release --target $(HOST_TRIPLE) -- push \
-	    --bin $(CURDIR)/$(FW_BIN) \
-	    --repo $(OCI_REPO) \
-	    --git-sha $(GIT_SHA)
-	@echo ">>> Signing $(OCI_REPO):latest with cosign (keyless OIDC)"
-	. ./gh.env && COSIGN_REGISTRY_USERNAME=imjasonh COSIGN_REGISTRY_PASSWORD="$$GH_TOKEN" \
-	    cosign sign --yes $(OCI_REPO):latest
+	@set -e; \
+	    . ./gh.env; \
+	    DIGEST=$$(cd tools/publisher && cargo run --release --target $(HOST_TRIPLE) -- push \
+	        --bin $(CURDIR)/$(FW_BIN) \
+	        --repo $(OCI_REPO) \
+	        --git-sha $(GIT_SHA) | grep '^digest:' | head -1 | cut -d' ' -f2); \
+	    test -n "$$DIGEST" || { echo "ERROR: publisher did not emit a 'digest:' line on stdout"; exit 1; }; \
+	    echo ">>> Signing $(OCI_REPO)@$$DIGEST with cosign (keyless OIDC)"; \
+	    COSIGN_REGISTRY_USERNAME=$(COSIGN_REGISTRY_USERNAME) COSIGN_REGISTRY_PASSWORD="$$GH_TOKEN" \
+	        cosign sign --yes $(OCI_REPO)@$$DIGEST
 
 # Pull the latest artifact from OCI_REPO and verify its layer SHA matches
 # our locally-built firmware. Confirms the round trip works and exercises

@@ -1,0 +1,91 @@
+name: Publish OTA
+
+# Build the firmware on every push to main, push it as an OCI artifact
+# to ghcr.io/imjasonh/esp32, and sign it keylessly with cosign using
+# the workflow's ambient OIDC token. The on-device verifier in
+# src/trust.rs trusts this workflow's identity for OTA updates.
+#
+# Required repo secrets:
+#   WIFI_SSID, WIFI_PASS — embedded into the firmware at compile time
+#   (see src/main.rs env!()). The GITHUB_TOKEN is auto-provided.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Don't run two publish jobs at once -- :latest would race. The newer
+# commit wins.
+concurrency:
+  group: publish
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write   # cosign keyless OIDC
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cmake + ninja
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Setup uv (for python-shim)
+        uses: astral-sh/setup-uv@v3
+
+      - name: Setup Xtensa toolchain (espup)
+        uses: esp-rs/xtensa-toolchain@v1.5
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: true
+
+      - name: Install espflash
+        run: cargo install espflash@3 --locked
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Cache .embuild (ESP-IDF + tools)
+        uses: actions/cache@v4
+        with:
+          path: .embuild
+          key: embuild-v5.2.2-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            embuild-v5.2.2-${{ runner.os }}-
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            tools/publisher
+          shared-key: publish
+
+      - name: Write env files from secrets
+        env:
+          WIFI_SSID: ${{ secrets.WIFI_SSID }}
+          WIFI_PASS: ${{ secrets.WIFI_PASS }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # %q escapes for safe sourcing regardless of special chars.
+          {
+            printf 'export WIFI_SSID=%q\n' "$WIFI_SSID"
+            printf 'export WIFI_PASS=%q\n' "$WIFI_PASS"
+          } > wifi.env
+          printf 'export GH_TOKEN=%q\n' "$GH_TOKEN" > gh.env
+          chmod 600 wifi.env gh.env
+
+      - name: Build, push, and sign
+        env:
+          # cosign uses GH_TOKEN for registry auth (push the sig
+          # artifact to GHCR). The OIDC identity for keyless signing
+          # is the workflow's ambient token, picked up automatically
+          # because we set id-token: write at the job level.
+          COSIGN_REGISTRY_USERNAME: ${{ github.actor }}
+        run: make publish

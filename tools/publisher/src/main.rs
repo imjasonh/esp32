@@ -97,7 +97,12 @@ struct FirmwareConfig {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Logs go to stderr so stdout is reserved for machine-readable output
+    // (the `digest:` line emitted by the push subcommand for downstream
+    // tooling — `make publish` parses it to feed `cosign sign` an
+    // immutable digest reference).
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -250,6 +255,7 @@ async fn push(args: PushArgs) -> Result<()> {
         tags.push(format!("sha-{}", sha));
     }
 
+    let mut printed_digest: Option<String> = None;
     for tag in &tags {
         let reference: Reference = format!("{}:{}", args.repo, tag)
             .parse()
@@ -265,14 +271,40 @@ async fn push(args: PushArgs) -> Result<()> {
             )
             .await
             .with_context(|| format!("push {}", reference))?;
+        let digest = digest_from_manifest_url(&resp.manifest_url)
+            .ok_or_else(|| anyhow::anyhow!("could not parse digest from {}", resp.manifest_url))?;
         tracing::info!(
             reference = %reference,
             manifest_url = %resp.manifest_url,
+            digest = %digest,
             "pushed",
         );
+        // Print the manifest digest once on stdout, machine-readable, so
+        // downstream tooling (cosign sign) can target the immutable
+        // digest instead of a moving tag.
+        if printed_digest.is_none() {
+            println!("digest: {}", digest);
+            printed_digest = Some(digest.to_string());
+        } else if printed_digest.as_deref() != Some(digest) {
+            // Both pushes are the same content, so digests must match.
+            // If they don't, something's deeply wrong (different
+            // manifest bytes between calls?). Fail loudly.
+            return Err(anyhow::anyhow!(
+                "tag {} pushed at digest {} but earlier push was at {}",
+                tag,
+                digest,
+                printed_digest.as_deref().unwrap_or("?"),
+            ));
+        }
     }
 
     Ok(())
+}
+
+/// Extract `sha256:abc...` from a manifest URL like
+/// `https://ghcr.io/v2/owner/name/manifests/sha256:abc...`.
+fn digest_from_manifest_url(url: &str) -> Option<&str> {
+    url.rsplit_once("/manifests/").map(|(_, d)| d)
 }
 
 fn build_manifest(

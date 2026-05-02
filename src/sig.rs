@@ -80,15 +80,15 @@ pub fn verify_bundle(bundle_json: &[u8], expected_manifest_digest_hex: &str) -> 
         .context("base64-decode leaf cert")?;
     let leaf = Certificate::from_der(&cert_der).context("parse leaf cert DER")?;
 
-    let email = extract_san_email(&leaf).context("extract SAN email")?;
+    let identity = extract_san_identity(&leaf).context("extract SAN identity")?;
     let issuer = extract_oidc_issuer_v1(&leaf).context("extract OIDC issuer")?;
     if !trust::TRUSTED_IDENTITIES
         .iter()
-        .any(|(e, i)| *e == email && *i == issuer)
+        .any(|(id, iss)| *id == identity && *iss == issuer)
     {
-        bail!("untrusted identity: email={} issuer={}", email, issuer);
+        bail!("untrusted identity: {} (issuer {})", identity, issuer);
     }
-    tracing::info!(email = %email, issuer = %issuer, "ota: signer identity OK");
+    tracing::info!(identity = %identity, issuer = %issuer, "ota: signer identity OK");
 
     verify_chain(&leaf).context("cert chain verification")?;
     tracing::info!("ota: cert chain to Sigstore root OK");
@@ -149,7 +149,11 @@ fn pae_dsse_v1(payload_type: &str, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn extract_san_email(cert: &Certificate) -> Result<String> {
+/// Extract the signer identity from a Fulcio cert's SAN extension.
+/// Returns the email (for OIDC issuers like accounts.google.com) or the
+/// URI (for workflow-based issuers like GitHub Actions, where the URI
+/// is e.g. `https://github.com/<owner>/<repo>/.github/workflows/<wf>.yml@<ref>`).
+fn extract_san_identity(cert: &Certificate) -> Result<String> {
     let san_oid: ObjectIdentifier = OID_SAN.parse().unwrap();
     let extensions = cert
         .tbs_certificate
@@ -161,11 +165,13 @@ fn extract_san_email(cert: &Certificate) -> Result<String> {
             let san = SubjectAltName::from_der(ext.extn_value.as_bytes())
                 .context("parse SubjectAltName")?;
             for name in &san.0 {
-                if let GeneralName::Rfc822Name(email) = name {
-                    return Ok(email.to_string());
+                match name {
+                    GeneralName::Rfc822Name(email) => return Ok(email.to_string()),
+                    GeneralName::UniformResourceIdentifier(uri) => return Ok(uri.to_string()),
+                    _ => {}
                 }
             }
-            bail!("SAN extension has no rfc822Name (email)");
+            bail!("SAN extension has no rfc822Name (email) or URI");
         }
     }
     bail!("no SubjectAltName extension")
