@@ -88,7 +88,7 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
     let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
         Ok(n) => n,
         Err(e) => {
-            log::error!("ota: failed to open NVS namespace: {:?}", e);
+            tracing::error!("ota: failed to open NVS namespace: {:?}", e);
             // Sleep forever rather than crash the app.
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
@@ -98,13 +98,13 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
 
     let cfg = OtaConfig::load_from_nvs(&nvs);
     let last = read_string(&nvs, NVS_LAST_DIGEST).unwrap_or_else(|| "<none>".into());
-    log::info!(
-        "ota: boot summary fw={} repo={} tag={} poll={}s last_digest={}",
-        fw_version,
-        cfg.repo,
-        cfg.tag,
-        cfg.poll_interval.as_secs(),
-        last,
+    tracing::info!(
+        fw = fw_version,
+        repo = %cfg.repo,
+        tag = %cfg.tag,
+        poll_secs = cfg.poll_interval.as_secs(),
+        last_digest = %last,
+        "ota: boot summary",
     );
 
     let mut consecutive_failures: u32 = 0;
@@ -114,28 +114,28 @@ pub fn run(nvs_partition: EspDefaultNvsPartition, fw_version: &str) -> ! {
         } else {
             jittered(cfg.poll_interval)
         };
-        log::info!(
-            "ota: sleeping {}s (failures={})",
-            sleep_for.as_secs(),
-            consecutive_failures
+        tracing::info!(
+            sleep_secs = sleep_for.as_secs(),
+            failures = consecutive_failures,
+            "ota: sleeping",
         );
         std::thread::sleep(sleep_for);
         match poll_once(&mut nvs, &cfg) {
             Ok(PollOutcome::NoChange) => {
                 consecutive_failures = 0;
-                log::info!("ota: no change");
+                tracing::info!("ota: no change");
             }
             Ok(PollOutcome::Updated(d)) => {
-                log::info!("ota: applied {}, rebooting in 1s", d);
+                tracing::info!(digest = %d, "ota: applied, rebooting in 1s");
                 std::thread::sleep(Duration::from_secs(1));
                 unsafe { esp_idf_svc::sys::esp_restart() };
             }
             Err(e) => {
                 consecutive_failures += 1;
-                log::warn!(
-                    "ota: poll failed (consecutive failures={}): {:#}",
-                    consecutive_failures,
-                    e
+                tracing::warn!(
+                    failures = consecutive_failures,
+                    error = %e,
+                    "ota: poll failed",
                 );
             }
         }
@@ -183,17 +183,21 @@ fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcom
     if layer.media_type != "application/vnd.esp32.firmware.bin" {
         bail!("unexpected layer mediaType: {}", layer.media_type);
     }
-    log::info!(
-        "ota: manifest layer digest={} size={}",
-        layer.digest,
-        layer.size
+    tracing::info!(
+        digest = %layer.digest,
+        size = layer.size,
+        "ota: manifest layer",
     );
 
     let last = read_string(nvs, NVS_LAST_DIGEST).unwrap_or_default();
     if last == layer.digest {
         return Ok(PollOutcome::NoChange);
     }
-    log::info!("ota: new digest (was {}), downloading", if last.is_empty() { "<none>" } else { &last });
+    tracing::info!(
+        previous = %if last.is_empty() { "<none>" } else { &last },
+        new = %layer.digest,
+        "ota: new digest, downloading",
+    );
 
     download_and_apply(&cfg.repo, &layer, &token)?;
 
@@ -314,7 +318,7 @@ fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()>
         hasher.update(&buf[..n]);
         total += n as u64;
         if total >= next_log {
-            log::info!("ota: wrote {}/{} bytes", total, layer.size);
+            tracing::info!(written = total, total = layer.size, "ota: download progress");
             next_log += 256 * 1024;
         }
     }
@@ -331,7 +335,7 @@ fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()>
             expected_sha_hex
         );
     }
-    log::info!("ota: download complete, SHA verified, finalizing");
+    tracing::info!("ota: download complete, SHA verified, finalizing");
     update.complete().context("OTA complete (set boot partition)")?;
     Ok(())
 }
@@ -362,13 +366,13 @@ pub fn is_pending_verify() -> bool {
         let mut state: esp_ota_img_states_t = 0;
         let err = esp_ota_get_state_partition(part, &mut state);
         if err != ESP_OK {
-            log::warn!("ota: esp_ota_get_state_partition err={}", err);
+            tracing::warn!(err, "ota: esp_ota_get_state_partition failed");
             return false;
         }
-        log::info!(
-            "ota: running partition state = {} ({})",
+        tracing::info!(
             state,
-            ota_state_name(state)
+            name = ota_state_name(state),
+            "ota: running partition state",
         );
         state == esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
     }
@@ -384,7 +388,7 @@ pub fn mark_valid_after_pending_verify_passed(
     if err != ESP_OK {
         bail!("esp_ota_mark_app_valid_cancel_rollback err={}", err);
     }
-    log::info!("ota: marked app valid, rollback cancelled");
+    tracing::info!("ota: marked app valid, rollback cancelled");
 
     let mut nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)
         .context("open ota NVS namespace")?;
@@ -392,7 +396,7 @@ pub fn mark_valid_after_pending_verify_passed(
         write_string(&mut nvs, NVS_LAST_DIGEST, &pending)?;
         // Best-effort clear of pending; not fatal if it fails.
         let _ = nvs.remove(NVS_PENDING_DIGEST);
-        log::info!("ota: promoted pending {} -> last_digest", pending);
+        tracing::info!(digest = %pending, "ota: promoted pending -> last_digest");
     }
     Ok(())
 }

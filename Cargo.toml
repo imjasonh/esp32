@@ -22,7 +22,11 @@ pio = ["esp-idf-svc/pio"]
 std = ["esp-idf-svc/std"]
 
 [dependencies]
-log = "0.4"
+# `log` feature makes tracing events emit log records too, so EspLogger
+# (which is a log::Logger) picks them up and writes via esp_log_write.
+# No tracing subscriber needed on the device; structured fields render
+# into the message text.
+tracing = { version = "0.1", features = ["log"] }
 anyhow = "1"
 esp-idf-svc = "0.51"
 embedded-svc = "0.28"

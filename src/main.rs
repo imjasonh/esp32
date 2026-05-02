@@ -24,11 +24,11 @@ fn main() -> Result<()> {
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log_running_partition();
-    log::info!("booting firmware version: {}", FW_VERSION);
+    tracing::info!(version = FW_VERSION, "booting");
 
     let pending_verify = ota::is_pending_verify();
     if pending_verify {
-        log::info!("ota: this image is in PENDING_VERIFY -- bringup must succeed before mark-valid");
+        tracing::info!("ota: image is in PENDING_VERIFY -- bringup must succeed before mark-valid");
     }
 
     let peripherals = Peripherals::take()?;
@@ -43,16 +43,21 @@ fn main() -> Result<()> {
     connect_wifi(&mut wifi)?;
 
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
-    log::info!("connected: ip={} gw={} dns={:?}", ip_info.ip, ip_info.subnet.gateway, ip_info.dns);
+    tracing::info!(
+        ip = %ip_info.ip,
+        gateway = %ip_info.subnet.gateway,
+        dns = ?ip_info.dns,
+        "wifi connected",
+    );
 
     fetch("https://api.ipify.org?format=json")?;
     fetch("https://wttr.in/?format=3")?;
 
     if pending_verify {
         match ota::mark_valid_after_pending_verify_passed(nvs.clone()) {
-            Ok(()) => log::info!("ota: pending-verify passed, image is good"),
+            Ok(()) => tracing::info!("ota: pending-verify passed, image is good"),
             Err(e) => {
-                log::error!("ota: mark-valid failed: {:#}; rebooting to trigger rollback", e);
+                tracing::error!(error = %e, "ota: mark-valid failed; rebooting to trigger rollback");
                 std::thread::sleep(Duration::from_secs(2));
                 unsafe { esp_idf_svc::sys::esp_restart() };
             }
@@ -68,7 +73,7 @@ fn main() -> Result<()> {
         .spawn(move || ota::run(ota_nvs, FW_VERSION))
         .expect("spawn ota thread");
 
-    log::info!("main: idling, OTA loop running in background");
+    tracing::info!("main: idling, OTA loop running in background");
     loop {
         std::thread::sleep(Duration::from_secs(3600));
     }
@@ -78,15 +83,15 @@ fn log_running_partition() {
     unsafe {
         let part = esp_idf_svc::sys::esp_ota_get_running_partition();
         if part.is_null() {
-            log::warn!("running partition: <null>");
+            tracing::warn!("running partition: <null>");
             return;
         }
         let label = CStr::from_ptr((*part).label.as_ptr()).to_string_lossy();
-        log::info!(
-            "running partition: {} (offset=0x{:x}, size=0x{:x})",
-            label,
-            (*part).address,
-            (*part).size,
+        tracing::info!(
+            label = %label,
+            offset = format_args!("0x{:x}", (*part).address),
+            size = format_args!("0x{:x}", (*part).size),
+            "running partition",
         );
     }
 }
@@ -108,15 +113,13 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
     }))?;
 
     wifi.start()?;
-    log::info!("wifi started; connecting to ssid={}", SSID);
+    tracing::info!(ssid = SSID, "wifi started; connecting");
     wifi.connect()?;
     wifi.wait_netif_up()?;
     Ok(())
 }
 
 fn fetch(url: &str) -> Result<()> {
-    log::info!("GET {}", url);
-
     let conn = EspHttpConnection::new(&HttpConfig {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
@@ -126,7 +129,6 @@ fn fetch(url: &str) -> Result<()> {
     let req = client.request(Method::Get, url, &[("accept", "*/*")])?;
     let mut resp = req.submit()?;
     let status = resp.status();
-    log::info!("  status={}", status);
 
     let mut buf = [0u8; 1024];
     let mut total = 0usize;
@@ -139,6 +141,12 @@ fn fetch(url: &str) -> Result<()> {
         total += n;
         body.extend_from_slice(&buf[..n]);
     }
-    log::info!("  body ({} bytes): {}", total, String::from_utf8_lossy(&body).trim());
+    tracing::info!(
+        url = url,
+        status = status,
+        bytes = total,
+        body = %String::from_utf8_lossy(&body).trim(),
+        "GET",
+    );
     Ok(())
 }
