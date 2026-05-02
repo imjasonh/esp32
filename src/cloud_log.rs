@@ -420,7 +420,7 @@ impl CachedToken {
     }
 }
 
-fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<sha2::Sha256>> {
+fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<rsa::sha2::Sha256>> {
     // Trim trailing whitespace — jq -r adds a final newline on top of
     // the PEM's own trailing newline, and pem-rfc7468 then tries to
     // parse a second (empty) block and errors at "pre-encapsulation
@@ -429,7 +429,7 @@ fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<sha2::Sha256>> {
         .context("SA key PEM is not UTF-8")?
         .trim();
     let key = RsaPrivateKey::from_pkcs8_pem(pem_str).context("parse SA PKCS#8 private key")?;
-    Ok(SigningKey::<sha2::Sha256>::new(key))
+    Ok(SigningKey::<rsa::sha2::Sha256>::new(key))
 }
 
 #[derive(Serialize)]
@@ -456,7 +456,7 @@ struct TokenResp {
 
 fn mint_access_token(
     cfg: &GcpConfig,
-    signing_key: &SigningKey<sha2::Sha256>,
+    signing_key: &SigningKey<rsa::sha2::Sha256>,
 ) -> Result<CachedToken> {
     let now = now_unix_secs().ok_or_else(|| anyhow!("NTP not synced; cannot mint JWT"))?;
 

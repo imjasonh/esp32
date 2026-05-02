@@ -264,7 +264,7 @@ fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<(Manifest, Strin
         ],
         &mut buf,
     )?;
-    let digest_hex = format!("{:x}", Sha256::digest(&buf));
+    let digest_hex = hex::encode(Sha256::digest(&buf));
     let m: Manifest = serde_json::from_slice(&buf)
         .with_context(|| format!("parse manifest JSON ({} bytes)", buf.len()))?;
     Ok((m, digest_hex))
@@ -445,7 +445,7 @@ fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()>
         update.abort().ok();
         bail!("blob size mismatch: got {}, expected {}", total, layer.size);
     }
-    let actual_sha_hex = format!("{:x}", hasher.finalize());
+    let actual_sha_hex = hex::encode(hasher.finalize());
     if actual_sha_hex != expected_sha_hex {
         update.abort().ok();
         bail!(
