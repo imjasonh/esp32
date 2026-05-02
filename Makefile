@@ -1,21 +1,24 @@
 # ESP32 Rust — runnable documentation for build / flash / monitor.
 # See notes.txt for one-time setup (espup, brew deps, Python 3.12 shim).
 #
-# Quick start:
-#   make wifi.env        # one-time: copy wifi.env.example -> wifi.env
-#   $EDITOR wifi.env     # fill in WIFI_SSID and WIFI_PASS
-#   make run             # build, flash, open serial monitor
+# Quick start (new device):
+#   make provisioning.toml   # one-time: copy template
+#   $EDITOR provisioning.toml  # fill in wifi creds, trust identities
+#   make bootstrap           # full reflash + write NVS partition
+#   make monitor             # watch it boot + connect
 
 PORT ?= /dev/cu.usbserial-0001
 BIN  := target/xtensa-esp32-espidf/release/esp32-blinky
 
-# Host triple for building the publisher tool. Detected via rustc so this
-# works on any developer machine without hardcoding aarch64-apple-darwin.
+# Host triple for building host-side tools (publisher, provision).
 HOST_TRIPLE := $(shell rustc -vV | sed -n 's/^host: //p')
 
 # App-only firmware binary (no bootloader / partition table) suitable for
 # pushing as the OTA artifact layer.
 FW_BIN := target/firmware.bin
+
+# Generated NVS partition image written by `tools/provision/`.
+NVS_BIN := target/nvs.bin
 
 # OCI artifact destination.
 OCI_REPO ?= ghcr.io/imjasonh/esp32
@@ -46,29 +49,29 @@ PYTHON_SHIM := $(CURDIR)/.embuild/python-shim
 export LIBCLANG_PATH
 export PATH := $(PYTHON_SHIM):$(XTENSA_GCC_BIN):$(PATH)
 
-# Wi-Fi credentials (gitignored). Sourced inline because wifi.env uses
-# bash `export VAR="value"` syntax, not Make assignment syntax.
-WIFI_ENV := . ./wifi.env
-
-.PHONY: help build flash flash-all monitor run clean ensure-python-shim save-image publish pull-verify check-gh-env
+.PHONY: help build flash flash-all monitor run clean ensure-python-shim \
+        save-image publish pull-verify check-gh-env \
+        provision provision-build bootstrap
 
 help:
 	@echo "Targets:"
-	@echo "  make build     Compile firmware (requires wifi.env)"
-	@echo "  make flash     Build (if needed) and flash app to $(PORT)"
-	@echo "  make flash-all Erase + write bootloader, partition table, app"
-	@echo "  make monitor   Open serial monitor on $(PORT)  (Ctrl+C to exit)"
-	@echo "  make run       Build + flash + monitor"
-	@echo "  make clean     cargo clean"
-	@echo "  make wifi.env  Create wifi.env from template"
-	@echo "  make save-image   Convert ELF -> app-only .bin (target/firmware.bin)"
-	@echo "  make publish      Build, save-image, push OCI artifact to OCI_REPO"
-	@echo "  make pull-verify  Pull from OCI_REPO and check layer matches local .bin"
+	@echo "  make build         Compile firmware"
+	@echo "  make flash         Build (if needed) and flash app to $(PORT)"
+	@echo "  make flash-all     Erase + write bootloader, partition table, app"
+	@echo "  make monitor       Open serial monitor on $(PORT)  (Ctrl+C to exit)"
+	@echo "  make run           Build + flash + monitor"
+	@echo "  make clean         cargo clean"
+	@echo "  make save-image    Convert ELF -> app-only .bin (target/firmware.bin)"
+	@echo "  make publish       Build, save-image, push OCI artifact to OCI_REPO"
+	@echo "  make pull-verify   Pull from OCI_REPO and check layer matches local .bin"
+	@echo ""
+	@echo "  make provision     Build NVS image from provisioning.toml + flash to device"
+	@echo "  make bootstrap     flash-all + provision (new device setup)"
 	@echo ""
 	@echo "Override the port: make flash PORT=/dev/cu.usbserial-XXXX"
 
-build: wifi.env ensure-python-shim sdkconfig.defaults
-	$(WIFI_ENV) && cargo build --release
+build: ensure-python-shim sdkconfig.defaults
+	cargo build --release
 
 # sdkconfig.defaults is generated from the .in template so we can substitute
 # the absolute project path into CONFIG_PARTITION_TABLE_CUSTOM_FILENAME
@@ -98,9 +101,10 @@ flash: build
 	espflash flash --port $(PORT) $(BIN)
 
 # Full reflash: erase entire flash, then write bootloader + partition table
-# + app. Use this when the partition table changes (phase 0 of OTA), or as
-# the recovery path if both OTA slots are bad and anti-bricking failed.
-# After erase, otadata is empty and the bootloader picks ota_0 by default.
+# + app. Use this when the partition table changes, or as the recovery
+# path if both OTA slots are bad and anti-bricking failed. After erase,
+# otadata is empty and the bootloader picks ota_0 by default. NVS is also
+# wiped, so the device will boot strict-inert until `make provision`.
 BOOTLOADER := $(firstword $(wildcard target/xtensa-esp32-espidf/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin))
 
 flash-all: build
@@ -119,6 +123,46 @@ run: build
 
 clean:
 	cargo clean
+
+# Build NVS partition image from provisioning.toml AND flash it to the
+# device over USB. Requires `make build` to have run at least once so
+# embuild has cloned ESP-IDF (needed for nvs_partition_gen.py).
+provision: provisioning.toml build
+	cd tools/provision && cargo run --release --target $(HOST_TRIPLE) -- \
+	    --config $(CURDIR)/provisioning.toml \
+	    --out $(CURDIR)/$(NVS_BIN) \
+	    --nvs-gen $(NVS_GEN_PY) \
+	    --python $(NVS_GEN_PYTHON) \
+	    --port $(PORT) \
+	    --flash
+
+# Build the NVS image without flashing (useful for inspection / CI).
+provision-build: provisioning.toml build
+	cd tools/provision && cargo run --release --target $(HOST_TRIPLE) -- \
+	    --config $(CURDIR)/provisioning.toml \
+	    --out $(CURDIR)/$(NVS_BIN) \
+	    --nvs-gen $(NVS_GEN_PY) \
+	    --python $(NVS_GEN_PYTHON)
+
+# ESP-IDF's NVS partition generator + the python venv to run it in.
+# Both come from .embuild after `make build` has cloned ESP-IDF.
+NVS_GEN_PY     := $(CURDIR)/.embuild/espressif/esp-idf/v5.2.2/components/nvs_flash/nvs_partition_generator/nvs_partition_gen.py
+NVS_GEN_PYTHON := $(CURDIR)/.embuild/espressif/python_env/idf5.2_py3.12_env/bin/python
+
+# Common new-device setup: full reflash + provision NVS. After this the
+# device should boot, connect to Wi-Fi, and start polling for OTAs.
+bootstrap: flash-all provision
+
+# If provisioning.toml exists, this target is up-to-date and the recipe
+# doesn't run. If absent, copy the template, tell the user to edit it,
+# and fail so they can't accidentally provision with placeholder values.
+provisioning.toml:
+	@cp provisioning.toml.example provisioning.toml
+	@echo ""
+	@echo "Created provisioning.toml from provisioning.toml.example."
+	@echo "Edit it with your real Wi-Fi creds + trust identities, then re-run."
+	@echo ""
+	@exit 1
 
 # Convert the firmware ELF into an app-only .bin (no bootloader / partition
 # table). This is the format the OTA writer expects on the device, and what
@@ -144,8 +188,7 @@ publish: $(FW_BIN) check-gh-env
 	        cosign sign --yes $(OCI_REPO)@$$DIGEST
 
 # Pull the latest artifact from OCI_REPO and verify its layer SHA matches
-# our locally-built firmware. Confirms the round trip works and exercises
-# the same oci-distribution API the device will use in phase 2.
+# our locally-built firmware. Confirms the round trip works.
 pull-verify: $(FW_BIN) check-gh-env
 	. ./gh.env && cd tools/publisher && cargo run --release --target $(HOST_TRIPLE) -- pull-verify \
 	    --repo $(OCI_REPO) \
@@ -161,14 +204,3 @@ check-gh-env:
 	    echo "See README.md for how to mint a classic PAT with write:packages."; \
 	    exit 1; \
 	}
-
-# If wifi.env exists, this target is up-to-date and the recipe doesn't run.
-# If it doesn't exist, copy the template, tell the user to edit it, and
-# fail so they can't accidentally flash with placeholder creds.
-wifi.env:
-	@cp wifi.env.example wifi.env
-	@echo ""
-	@echo "Created wifi.env from wifi.env.example."
-	@echo "Edit it with your real Wi-Fi SSID and password, then re-run."
-	@echo ""
-	@exit 1

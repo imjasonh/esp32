@@ -43,19 +43,27 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
 ## First flash (USB)
 
 ```bash
-make wifi.env             # creates wifi.env from template
-$EDITOR wifi.env          # fill in WIFI_SSID and WIFI_PASS
-make flash-all run        # full erase + bootloader + partition + app, then monitor
+make provisioning.toml             # creates from template
+$EDITOR provisioning.toml          # fill in wifi creds + trust identities
+make bootstrap                     # build, flash everything, write NVS
+make monitor                       # watch it boot and connect
 ```
 
 The first build clones ESP-IDF v5.2.2 into `.embuild/` (5–10 min).
 Subsequent builds are fast.
 
+The OTA-distributed firmware **contains no secrets** — Wi-Fi creds and
+trust roots live in NVS, written via USB by `make provision`. See
+[`provisioning-plan.md`](provisioning-plan.md) for the full design.
+
 ## Day-to-day
 
 ```
-make build      Compile (requires wifi.env)
+make build      Compile firmware
 make flash      Build + flash app (use flash-all after partitions change)
+make flash-all  Erase + write bootloader, partition table, app
+make provision  Write NVS partition from provisioning.toml over USB
+make bootstrap  flash-all + provision (new device setup)
 make monitor    Open serial monitor; Ctrl+C to exit
 make run        Build + flash + monitor
 make publish    Build, push OCI artifact to ghcr.io/imjasonh/esp32, cosign sign
@@ -67,22 +75,3 @@ PAT setup) and a real cosign OIDC flow the first time per ~10min window
 — a browser pops to authenticate. CI does this automatically via the
 GitHub Actions workflow's ambient OIDC token.
 
-## Project layout
-
-```
-src/main.rs            firmware entrypoint, Wi-Fi + HTTPS + OTA loop
-src/ota.rs             OTA polling, manifest fetch, blob streaming
-src/sig.rs             cosign Sigstore Bundle verification
-src/trust.rs           compile-time allowlist of signer identities
-trust/                 bundled Sigstore Fulcio root + intermediate certs
-tools/publisher/       host-side Rust tool that pushes signed OCI artifacts
-.github/workflows/     ci.yml (PRs) + publish.yml (push to main)
-Cargo.toml             firmware deps
-partitions.csv         OTA-capable partition table (1.75 MB app slots)
-sdkconfig.defaults.in  ESP-IDF kconfig (Makefile substitutes paths)
-Makefile               build / flash / monitor / publish entrypoints
-wifi.env.example       template for compile-time Wi-Fi creds
-eink-plan.md           planned e-ink display work
-ota-plan.md            full OTA design + per-phase status
-notes.txt              internal design notes and setup gotchas
-```

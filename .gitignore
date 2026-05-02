@@ -2,9 +2,11 @@
 /.embuild
 wifi.env
 gh.env
+provisioning.toml
 sdkconfig.defaults
 tools/publisher/target
+tools/provision/target
 
-# Cargo.lock IS tracked: both crates here are binaries (firmware and
-# publisher), and binary Cargo.lock files should be committed for
-# reproducible builds.
+# Cargo.lock IS tracked: all crates here are binaries (firmware,
+# publisher, provision), and binary Cargo.lock files should be
+# committed for reproducible builds.

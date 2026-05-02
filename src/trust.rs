@@ -1,36 +1,89 @@
-//! Compile-time trust configuration for OTA signing verification.
+//! Trust configuration loaded from NVS at boot.
 //!
-//! These values cannot be changed via OTA — only by editing the source
-//! and reflashing over USB. That's the whole point: a compromised
-//! signing identity must not be able to update its own allowlist.
+//! What used to be `const TRUSTED_IDENTITIES` and `include_str!`'d
+//! Sigstore PEMs is now provisioned via USB into NVS (see
+//! `provisioning-plan.md`). The OTA-distributed firmware contains
+//! only the *code* that reads and uses these values, never the
+//! values themselves — so the public OCI image is device-agnostic
+//! and carries no policy data.
+//!
+//! Schema (must match what `tools/provision/` writes):
+//!
+//!   namespace=trust
+//!     identities    blob   JSON: [{"identity":"...","issuer":"..."}, ...]
+//!     fulcio_root   blob   PEM bytes (Sigstore root CA)
+//!     fulcio_inter  blob   PEM bytes (Sigstore intermediate CA)
 
-/// Allowlist of (identity, issuer) pairs the OTA verifier will accept
-/// as signers. The identity is the Fulcio cert's SAN value — either an
-/// rfc822Name (email, for OIDC issuers like Google) or a URI (for
-/// workflow-based issuers like GitHub Actions). The issuer is read from
-/// extension OID 1.3.6.1.4.1.57264.1.1 (the legacy Fulcio OIDC-issuer
-/// extension), which carries the OIDC issuer URL.
-pub const TRUSTED_IDENTITIES: &[(&str, &str)] = &[
-    // Manual `make publish` from a developer's machine. Browser-based
-    // OIDC against Google.
-    ("imjasonh@gmail.com", "https://accounts.google.com"),
+use anyhow::{anyhow, Context, Result};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use serde::Deserialize;
 
-    // Automated publishes from the GitHub Actions workflow on push to
-    // main. The URI pins the exact workflow file at the exact branch;
-    // a malicious commit that adds a different workflow file won't
-    // produce a matching SAN URI. Trust here is bounded by who can
-    // push to imjasonh/esp32:main (i.e. the source-of-truth itself).
-    (
-        "https://github.com/imjasonh/esp32/.github/workflows/publish.yml@refs/heads/main",
-        "https://token.actions.githubusercontent.com",
-    ),
-];
+const NVS_TRUST_NS: &str = "trust";
+const NVS_IDENTITIES: &str = "identities";
+const NVS_FULCIO_ROOT: &str = "fulcio_root";
+const NVS_FULCIO_INTER: &str = "fulcio_inter";
 
-/// Sigstore Public Good Instance Fulcio intermediate CA (v1). Used to
-/// verify the leaf signing cert was issued by Sigstore.
-pub const SIGSTORE_INTERMEDIATE_PEM: &str =
-    include_str!("../trust/fulcio_intermediate.pem");
+/// One entry from the allowlist. The OTA verifier accepts a signature
+/// only if the leaf cert's SAN value matches `identity` AND the OIDC
+/// issuer extension matches `issuer`.
+#[derive(Deserialize, Clone, Debug)]
+pub struct TrustedIdentity {
+    pub identity: String,
+    pub issuer: String,
+}
 
-/// Sigstore Public Good Instance Fulcio root CA (v1). Used to verify
-/// the bundled intermediate hasn't been swapped (defense in depth).
-pub const SIGSTORE_ROOT_PEM: &str = include_str!("../trust/fulcio_root.pem");
+/// The full set of trust roots needed to verify a Sigstore bundle.
+#[derive(Clone)]
+pub struct TrustConfig {
+    pub identities: Vec<TrustedIdentity>,
+    pub fulcio_root_pem: Vec<u8>,
+    pub fulcio_intermediate_pem: Vec<u8>,
+}
+
+impl TrustConfig {
+    /// Load from NVS. Returns `Ok(None)` if any required key is absent
+    /// (treat as "unprovisioned" — caller should refuse to verify).
+    pub fn load(partition: EspDefaultNvsPartition) -> Result<Option<Self>> {
+        let nvs = EspNvs::new(partition, NVS_TRUST_NS, false)
+            .map_err(|e| anyhow!("open NVS namespace {}: {:?}", NVS_TRUST_NS, e))?;
+
+        // PEMs are ~3KB; identities JSON is ~500 bytes. 4KB buffers
+        // give comfortable headroom for now.
+        let id_bytes = read_blob(&nvs, NVS_IDENTITIES, 4096)?;
+        let root_bytes = read_blob(&nvs, NVS_FULCIO_ROOT, 4096)?;
+        let inter_bytes = read_blob(&nvs, NVS_FULCIO_INTER, 4096)?;
+
+        match (id_bytes, root_bytes, inter_bytes) {
+            (Some(id), Some(root), Some(inter)) => {
+                let identities: Vec<TrustedIdentity> = serde_json::from_slice(&id)
+                    .context("parse trust/identities NVS blob as JSON")?;
+                if identities.is_empty() {
+                    return Err(anyhow!(
+                        "trust/identities is provisioned but contains no entries"
+                    ));
+                }
+                Ok(Some(Self {
+                    identities,
+                    fulcio_root_pem: root,
+                    fulcio_intermediate_pem: inter,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+fn read_blob(
+    nvs: &EspNvs<esp_idf_svc::nvs::NvsDefault>,
+    key: &str,
+    max_size: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; max_size];
+    match nvs
+        .get_blob(key, &mut buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_TRUST_NS, key, e))?
+    {
+        Some(bytes) => Ok(Some(bytes.to_vec())),
+        None => Ok(None),
+    }
+}

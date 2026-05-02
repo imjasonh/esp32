@@ -4,7 +4,7 @@ use esp_idf_svc::hal::peripherals::Peripherals;
 use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use esp_idf_svc::http::Method;
-use esp_idf_svc::nvs::EspDefaultNvsPartition;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
 };
@@ -15,8 +15,12 @@ mod ota;
 mod sig;
 mod trust;
 
-const SSID: &str = env!("WIFI_SSID");
-const PASS: &str = env!("WIFI_PASS");
+// NVS schema (must match what tools/provision/ writes):
+//   namespace=wifi   key=ssid (str), key=pass (str)
+const NVS_WIFI_NS: &str = "wifi";
+const NVS_WIFI_SSID: &str = "ssid";
+const NVS_WIFI_PASS: &str = "pass";
+
 // Set by the Makefile from `git rev-parse --short HEAD` and baked into
 // the firmware so each build identifies itself in the boot log.
 const FW_VERSION: &str = env!("GIT_SHA");
@@ -37,12 +41,29 @@ fn main() -> Result<()> {
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
+    // Read all required NVS config up front; strict-inert if anything is
+    // missing. See provisioning-plan.md.
+    let (ssid, pass) = match read_wifi_creds(nvs.clone())? {
+        Some(creds) => creds,
+        None => block_unprovisioned("wifi/ssid or wifi/pass missing in NVS"),
+    };
+    let trust = match trust::TrustConfig::load(nvs.clone())? {
+        Some(t) => t,
+        None => block_unprovisioned(
+            "trust/identities or trust/fulcio_{root,inter} missing in NVS",
+        ),
+    };
+    tracing::info!(
+        identities = trust.identities.len(),
+        "loaded trust config from NVS",
+    );
+
     let mut wifi = BlockingWifi::wrap(
         EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone()))?,
         sysloop,
     )?;
 
-    connect_wifi(&mut wifi)?;
+    connect_wifi(&mut wifi, &ssid, &pass)?;
 
     let ip_info = wifi.wifi().sta_netif().get_ip_info()?;
     tracing::info!(
@@ -67,12 +88,13 @@ fn main() -> Result<()> {
     }
 
     let ota_nvs = nvs.clone();
+    let ota_trust = trust.clone();
     std::thread::Builder::new()
         // HTTPS + JSON + SHA256 is ~32 KB; phase 4a adds X.509 parsing
         // and ECDSA P-256/P-384 verification on top, which want more.
         // 48 KB is observed-safe with headroom.
         .stack_size(48 * 1024)
-        .spawn(move || ota::run(ota_nvs, FW_VERSION))
+        .spawn(move || ota::run(ota_nvs, FW_VERSION, ota_trust))
         .expect("spawn ota thread");
 
     tracing::info!("main: idling, OTA loop running in background");
@@ -98,28 +120,60 @@ fn log_running_partition() {
     }
 }
 
-fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>) -> Result<()> {
-    let auth_method = if PASS.is_empty() {
+fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &str) -> Result<()> {
+    let auth_method = if pass.is_empty() {
         AuthMethod::None
     } else {
         AuthMethod::WPA2Personal
     };
 
     wifi.set_configuration(&WifiConfig::Client(ClientConfiguration {
-        ssid: SSID.try_into().map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
+        ssid: ssid.try_into().map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
         bssid: None,
         auth_method,
-        password: PASS.try_into().map_err(|_| anyhow!("password too long (max 64 bytes)"))?,
+        password: pass.try_into().map_err(|_| anyhow!("password too long (max 64 bytes)"))?,
         channel: None,
         ..Default::default()
     }))?;
 
     wifi.start()?;
-    tracing::info!(ssid = SSID, "wifi started; connecting");
+    tracing::info!(ssid = ssid, "wifi started; connecting");
     wifi.connect()?;
     wifi.wait_netif_up()?;
     Ok(())
 }
+
+/// Read Wi-Fi credentials from NVS. Returns None if either key is missing.
+fn read_wifi_creds(partition: EspDefaultNvsPartition) -> Result<Option<(String, String)>> {
+    let nvs = EspNvs::new(partition, NVS_WIFI_NS, false)
+        .map_err(|e| anyhow!("open NVS namespace {}: {:?}", NVS_WIFI_NS, e))?;
+    let mut ssid_buf = [0u8; 64];
+    let mut pass_buf = [0u8; 96];
+    let ssid = nvs
+        .get_str(NVS_WIFI_SSID, &mut ssid_buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_WIFI_NS, NVS_WIFI_SSID, e))?;
+    let pass = nvs
+        .get_str(NVS_WIFI_PASS, &mut pass_buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_WIFI_NS, NVS_WIFI_PASS, e))?;
+    match (ssid, pass) {
+        (Some(s), Some(p)) => Ok(Some((s.to_string(), p.to_string()))),
+        _ => Ok(None),
+    }
+}
+
+/// Sit forever logging that the device is unprovisioned. Doesn't reboot
+/// (the firmware itself is healthy, just needs config), so a power cycle
+/// in PENDING_VERIFY state will roll back as a safety net.
+fn block_unprovisioned(reason: &str) -> ! {
+    loop {
+        tracing::error!(
+            reason = reason,
+            "NOT PROVISIONED — run `make provision` to write NVS, then reboot",
+        );
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
 
 fn fetch(url: &str) -> Result<()> {
     let conn = EspHttpConnection::new(&HttpConfig {
