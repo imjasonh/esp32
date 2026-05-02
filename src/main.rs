@@ -93,6 +93,36 @@ fn main() -> Result<()> {
         "wifi connected",
     );
 
+    // SNTP is only needed for cloud logging — the service-account JWT
+    // auth requires real wall-clock time for `iat`/`exp` (Google rejects
+    // tokens minted from a 1970 clock). Devices without `[gcp]` skip
+    // the wait and boot faster. Cloud Logging entry timestamps
+    // themselves are assigned server-side by GCP if we omit them.
+    let _sntp = if gcp.is_some() {
+        let sntp = esp_idf_svc::sntp::EspSntp::new_default()?;
+        let started = std::time::Instant::now();
+        loop {
+            use esp_idf_svc::sntp::SyncStatus;
+            if sntp.get_sync_status() == SyncStatus::Completed {
+                tracing::info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "ntp: synced",
+                );
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(15) {
+                tracing::warn!(
+                    "ntp: not synced after 15s, cloud logging will fail until clock catches up",
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Some(sntp)
+    } else {
+        None
+    };
+
     fetch("https://api.ipify.org?format=json")?;
     fetch("https://wttr.in/?format=3")?;
 

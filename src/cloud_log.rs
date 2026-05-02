@@ -11,8 +11,18 @@
 //! missing required keys (`project_id`, `sa_email`, `sa_key_id`,
 //! `sa_key_pem`), the firmware boots normally with serial-only logs.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use base64::Engine;
+use embedded_svc::http::client::Client;
+use embedded_svc::io::Write as _;
+use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection, FollowRedirectsPolicy};
+use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use rsa::pkcs1v15::SigningKey;
+use rsa::pkcs8::DecodePrivateKey;
+use rsa::signature::{SignatureEncoding, Signer};
+use rsa::RsaPrivateKey;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -187,6 +197,13 @@ impl CloudLogLayer {
 
 impl<S: Subscriber> Layer<S> for CloudLogLayer {
     fn on_event(&self, event: &Event<'_>, _ctx: LayerContext<'_, S>) {
+        // Skip events emitted by this module itself, otherwise the
+        // sender's "post failed" / "token refreshed" tracing calls
+        // get pushed onto the queue it's draining, creating a tight
+        // feedback loop. Cloud_log's own messages stay serial-only.
+        if event.metadata().target() == module_path!() {
+            return;
+        }
         let level = *event.metadata().level();
         if level > self.min_level {
             // tracing's Level ordering: TRACE > DEBUG > INFO > WARN > ERROR.
@@ -276,58 +293,374 @@ impl FieldCapture {
     }
 }
 
-/// Background task. Periodically drains the queue and (in this stub)
-/// logs each entry to serial showing what it WOULD send. The real POST
-/// to Cloud Logging is in a follow-up commit.
+/// Sender thread main loop. Drains the queue every `FLUSH_INTERVAL`,
+/// mints/refreshes a service-account access token as needed, and
+/// POSTs batches to Cloud Logging.
+///
+/// Uses tracing internally — the `module_path!()` filter in
+/// `CloudLogLayer::on_event` keeps cloud_log's own messages out of
+/// the queue (no feedback loop).
 pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
-    // Use eprintln rather than tracing here to avoid feedback loops
-    // (this thread emitting tracing events that the layer would push
-    // back onto the queue).
-    eprintln!(
-        "cloud_log: stub sender starting (project={}, sa={}, key_id={}, key_pem_bytes={}, min_severity={:?})",
-        cfg.project_id,
-        cfg.sa_email,
-        cfg.sa_key_id,
-        cfg.sa_key_pem.len(),
-        cfg.min_severity
+    tracing::info!(
+        project = %cfg.project_id,
+        sa = %cfg.sa_email,
+        min_severity = ?cfg.min_severity,
+        "cloud_log: sender starting",
     );
+
+    // Parse the SA private key once at startup; if it's malformed
+    // we can't do anything useful and log loudly forever.
+    let signing_key = match parse_signing_key(&cfg.sa_key_pem) {
+        Ok(k) => k,
+        Err(e) => {
+            loop {
+                tracing::error!(
+                    error = %format!("{:#}", e),
+                    "cloud_log: SA key parse failed; sender disabled",
+                );
+                std::thread::sleep(Duration::from_secs(300));
+            }
+        }
+    };
+
+    let mac = device_mac();
+    let log_name = format!("projects/{}/logs/esp32-firmware", cfg.project_id);
+
+    let mut token: Option<CachedToken> = None;
+    let mut consecutive_failures: u32 = 0;
+
     loop {
-        std::thread::sleep(FLUSH_INTERVAL);
+        let sleep_for = if consecutive_failures > 0 {
+            // Exponential backoff capped at 5 min for cloud-logging
+            // failures (separate budget from the OTA loop).
+            let exp = consecutive_failures.min(5);
+            Duration::from_secs(FLUSH_INTERVAL.as_secs() << exp).min(Duration::from_secs(300))
+        } else {
+            FLUSH_INTERVAL
+        };
+        std::thread::sleep(sleep_for);
+
         let batch = queue.drain(BATCH_MAX_ENTRIES);
         if batch.is_empty() {
+            consecutive_failures = 0;
             continue;
         }
-        eprintln!(
-            "cloud_log: would POST batch of {} entries to projects/{}/logs/esp32-firmware",
-            batch.len(),
-            cfg.project_id
-        );
-        for entry in &batch {
-            // One-line summary per entry.
-            let ts = entry
-                .timestamp_unix_secs
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "<no-ntp>".into());
-            eprintln!(
-                "  [{}] {:?} {} {}{}{}",
-                ts,
-                entry.severity,
-                entry.target,
-                entry.message,
-                if entry.fields.is_empty() {
-                    String::new()
-                } else {
-                    format!(
-                        " {}",
-                        serde_json::to_string(&entry.fields).unwrap_or_default()
-                    )
-                },
-                if entry.dropped_before > 0 {
-                    format!(" (dropped {} before)", entry.dropped_before)
-                } else {
-                    String::new()
-                },
-            );
+
+        if token.as_ref().map_or(true, |t| t.expired_or_close()) {
+            match mint_access_token(&cfg, &signing_key) {
+                Ok(t) => {
+                    tracing::info!(
+                        expires_in_secs = t.expires_at_unix.saturating_sub(now_unix_secs().unwrap_or(0)),
+                        "cloud_log: minted new access token",
+                    );
+                    token = Some(t);
+                }
+                Err(e) => {
+                    consecutive_failures = consecutive_failures.saturating_add(1);
+                    tracing::warn!(
+                        failures = consecutive_failures,
+                        error = %format!("{:#}", e),
+                        "cloud_log: token mint failed",
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let bearer = &token.as_ref().unwrap().token;
+        match post_batch(&log_name, &cfg.project_id, &mac, bearer, &batch) {
+            Ok(()) => {
+                tracing::info!(
+                    entries = batch.len(),
+                    "cloud_log: posted batch",
+                );
+                consecutive_failures = 0;
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                tracing::warn!(
+                    entries = batch.len(),
+                    failures = consecutive_failures,
+                    error = %format!("{:#}", e),
+                    "cloud_log: post failed; dropping batch",
+                );
+                // Drop the batch on failure rather than re-enqueue
+                // (avoids unbounded growth on a long outage). Loss is
+                // already surfaced via dropped_before on subsequent
+                // entries.
+            }
         }
     }
+}
+
+struct CachedToken {
+    token: String,
+    expires_at_unix: u64,
+}
+
+impl CachedToken {
+    fn expired_or_close(&self) -> bool {
+        // Refresh 5 minutes before expiry to avoid races.
+        match now_unix_secs() {
+            Some(now) => now + 300 >= self.expires_at_unix,
+            None => true,
+        }
+    }
+}
+
+fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<sha2::Sha256>> {
+    let pem_str = std::str::from_utf8(pem_bytes).context("SA key PEM is not UTF-8")?;
+    let key = RsaPrivateKey::from_pkcs8_pem(pem_str).context("parse SA PKCS#8 private key")?;
+    Ok(SigningKey::<sha2::Sha256>::new(key))
+}
+
+#[derive(Serialize)]
+struct JwtHeader<'a> {
+    alg: &'static str,
+    typ: &'static str,
+    kid: &'a str,
+}
+
+#[derive(Serialize)]
+struct JwtClaims<'a> {
+    iss: &'a str,
+    scope: &'static str,
+    aud: &'static str,
+    iat: u64,
+    exp: u64,
+}
+
+#[derive(Deserialize)]
+struct TokenResp {
+    access_token: String,
+    expires_in: u64,
+}
+
+fn mint_access_token(
+    cfg: &GcpConfig,
+    signing_key: &SigningKey<sha2::Sha256>,
+) -> Result<CachedToken> {
+    let now = now_unix_secs().ok_or_else(|| anyhow!("NTP not synced; cannot mint JWT"))?;
+
+    let header = JwtHeader {
+        alg: "RS256",
+        typ: "JWT",
+        kid: &cfg.sa_key_id,
+    };
+    let claims = JwtClaims {
+        iss: &cfg.sa_email,
+        scope: "https://www.googleapis.com/auth/logging.write",
+        aud: "https://oauth2.googleapis.com/token",
+        iat: now,
+        exp: now + 3600,
+    };
+
+    let header_b64 = b64url(&serde_json::to_vec(&header)?);
+    let claims_b64 = b64url(&serde_json::to_vec(&claims)?);
+    let signing_input = format!("{}.{}", header_b64, claims_b64);
+    let sig = signing_key.sign(signing_input.as_bytes());
+    let sig_b64 = b64url(sig.to_bytes().as_ref());
+    let jwt = format!("{}.{}", signing_input, sig_b64);
+
+    let body = format!(
+        "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={}",
+        jwt
+    );
+    let resp_bytes = http_post(
+        "https://oauth2.googleapis.com/token",
+        "application/x-www-form-urlencoded",
+        body.as_bytes(),
+        None,
+    )
+    .context("POST oauth2/token")?;
+    let resp: TokenResp = serde_json::from_slice(&resp_bytes)
+        .context("parse token response JSON")?;
+
+    Ok(CachedToken {
+        token: resp.access_token,
+        expires_at_unix: now + resp.expires_in,
+    })
+}
+
+#[derive(Serialize)]
+struct WriteEntriesRequest<'a> {
+    #[serde(rename = "logName")]
+    log_name: &'a str,
+    resource: MonitoredResource<'a>,
+    entries: Vec<Entry>,
+}
+
+#[derive(Serialize)]
+struct MonitoredResource<'a> {
+    #[serde(rename = "type")]
+    type_: &'static str,
+    labels: ResourceLabels<'a>,
+}
+
+#[derive(Serialize)]
+struct ResourceLabels<'a> {
+    project_id: &'a str,
+    location: &'static str,
+    namespace: &'static str,
+    node_id: &'a str,
+}
+
+#[derive(Serialize)]
+struct Entry {
+    severity: &'static str,
+    #[serde(rename = "jsonPayload")]
+    json_payload: serde_json::Value,
+    #[serde(rename = "timestamp", skip_serializing_if = "Option::is_none")]
+    timestamp: Option<String>,
+}
+
+fn post_batch(
+    log_name: &str,
+    project_id: &str,
+    mac: &str,
+    bearer: &str,
+    batch: &[LogEntry],
+) -> Result<()> {
+    let entries: Vec<Entry> = batch
+        .iter()
+        .map(|e| Entry {
+            severity: severity_str(e.severity),
+            json_payload: build_payload(e),
+            timestamp: e.timestamp_unix_secs.and_then(unix_to_rfc3339),
+        })
+        .collect();
+    let _ = (project_id, mac); // used inline in MonitoredResource below
+
+    let req = WriteEntriesRequest {
+        log_name,
+        resource: MonitoredResource {
+            type_: "generic_node",
+            labels: ResourceLabels {
+                project_id,
+                location: "global",
+                namespace: "esp32",
+                node_id: mac,
+            },
+        },
+        entries,
+    };
+    let body = serde_json::to_vec(&req)?;
+    let auth = format!("Bearer {}", bearer);
+    http_post(
+        "https://logging.googleapis.com/v2/entries:write",
+        "application/json",
+        &body,
+        Some(&auth),
+    )
+    .map(|_| ())
+}
+
+fn severity_str(level: Level) -> &'static str {
+    // Cloud Logging severities (LogSeverity enum):
+    // https://cloud.google.com/logging/docs/reference/v2/rest/v2/LogEntry#logseverity
+    match level {
+        Level::TRACE => "DEBUG",
+        Level::DEBUG => "DEBUG",
+        Level::INFO => "INFO",
+        Level::WARN => "WARNING",
+        Level::ERROR => "ERROR",
+    }
+}
+
+fn build_payload(e: &LogEntry) -> serde_json::Value {
+    let mut map = e.fields.clone();
+    map.insert(
+        "message".to_string(),
+        serde_json::Value::String(e.message.clone()),
+    );
+    map.insert(
+        "module".to_string(),
+        serde_json::Value::String(e.target.clone()),
+    );
+    if e.dropped_before > 0 {
+        map.insert(
+            "dropped_before".to_string(),
+            serde_json::Value::Number(e.dropped_before.into()),
+        );
+    }
+    serde_json::Value::Object(map)
+}
+
+fn unix_to_rfc3339(secs: u64) -> Option<String> {
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    OffsetDateTime::from_unix_timestamp(secs as i64)
+        .ok()
+        .and_then(|dt| dt.format(&Rfc3339).ok())
+}
+
+fn b64url(input: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
+}
+
+/// Single helper for HTTPS POST. Returns the response body bytes.
+/// Errors on any non-2xx status with the body included for diagnosis.
+fn http_post(
+    url: &str,
+    content_type: &str,
+    body: &[u8],
+    bearer: Option<&str>,
+) -> Result<Vec<u8>> {
+    let conn = EspHttpConnection::new(&HttpConfig {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        follow_redirects_policy: FollowRedirectsPolicy::FollowAll,
+        timeout: Some(Duration::from_secs(30)),
+        buffer_size: Some(2048),
+        buffer_size_tx: Some(4096),
+        ..Default::default()
+    })?;
+    let mut client = Client::wrap(conn);
+    let body_len = body.len().to_string();
+    let mut headers: Vec<(&str, &str)> = vec![
+        ("content-type", content_type),
+        ("content-length", body_len.as_str()),
+        ("accept", "application/json"),
+    ];
+    if let Some(b) = bearer {
+        headers.push(("authorization", b));
+    }
+    let mut req = client.request(Method::Post, url, &headers)?;
+    req.write_all(body).context("write request body")?;
+    req.flush().ok();
+    let mut resp = req.submit()?;
+    let status = resp.status();
+    let mut buf = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = resp.read(&mut chunk).context("read response chunk")?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    if !(200..300).contains(&status) {
+        bail!(
+            "POST {} -> HTTP {} body={}",
+            url,
+            status,
+            String::from_utf8_lossy(&buf)
+        );
+    }
+    Ok(buf)
+}
+
+/// MAC address as a `aabbccddeeff` hex string. Used as the `node_id`
+/// label on Cloud Logging entries to identify which device the log
+/// came from.
+fn device_mac() -> String {
+    let mut mac = [0u8; 8];
+    unsafe {
+        esp_idf_svc::sys::esp_efuse_mac_get_default(mac.as_mut_ptr());
+    }
+    let mut s = String::with_capacity(12);
+    for b in &mac[..6] {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{:02x}", b);
+    }
+    s
 }
