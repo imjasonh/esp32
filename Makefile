@@ -71,7 +71,12 @@ help:
 	@echo "Override the port: make flash PORT=/dev/cu.usbserial-XXXX"
 
 build: ensure-python-shim sdkconfig.defaults
-	cargo build --release
+	# `+esp` selects the espup-installed toolchain explicitly. We don't
+	# use `rust-toolchain.toml` for the firmware crate anymore because
+	# Dependabot's runner doesn't have the esp toolchain installed and
+	# `cargo update` chokes on the override file. Host-side tools have
+	# their own `rust-toolchain.toml` pinning stable.
+	cargo +esp build --release
 
 # sdkconfig.defaults is generated from the .in template so we can substitute
 # the absolute project path into CONFIG_PARTITION_TABLE_CUSTOM_FILENAME

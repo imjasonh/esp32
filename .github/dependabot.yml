@@ -1,6 +1,8 @@
 # Weekly dep bumps, grouped per ecosystem so we get one PR per category
-# (one for GHA action versions, one for firmware Cargo deps, one for the
-# publisher Cargo deps) instead of N PRs per week.
+# instead of N PRs per week:
+#   - GHA action versions (across all workflow files)
+#   - firmware Cargo deps (root)
+#   - host tools Cargo deps (publisher + provision, batched together)
 
 version: 2
 updates:
@@ -22,11 +24,15 @@ updates:
         patterns:
           - "*"
 
+  # Both host tools share a similar dependency surface (clap, tracing,
+  # tokio, anyhow, serde). Batch them into one PR.
   - package-ecosystem: cargo
-    directory: /tools/publisher
+    directories:
+      - /tools/publisher
+      - /tools/provision
     schedule:
       interval: weekly
     groups:
-      publisher:
+      host-tools:
         patterns:
           - "*"

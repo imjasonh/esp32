@@ -16,8 +16,7 @@ partitions.csv            OTA-capable partition table (1.94 MB app slots)
 sdkconfig.defaults.in     ESP-IDF kconfig (Makefile substitutes paths)
 Makefile                  build / flash / monitor / provision / publish entrypoints
 provisioning.toml.example template for per-device NVS values
-ota.md                    full OTA system documentation
-provisioning-plan.md      provisioning design + future Secure Boot v2 work
+ota.md                    full OTA + provisioning + signing system documentation
 eink-plan.md              planned e-ink display work
 logs-plan.md              planned GCP Cloud Logging integration
 notes.txt                 internal design notes + setup gotchas (Python 3.12

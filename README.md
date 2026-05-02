@@ -12,9 +12,8 @@ GHCR + cosign keyless signing. E-ink display work coming next (see
 - Connects to Wi-Fi, fetches public IP and weather over HTTPS.
 - Polls `ghcr.io/imjasonh/esp32:latest` every ~60s for new firmware.
 - For each new digest, fetches the cosign Sigstore Bundle, verifies the
-  signature, the cert chain to the bundled Sigstore root, and that the
-  signer's identity matches the compile-time allowlist in
-  [`src/trust.rs`](src/trust.rs).
+  signature, the cert chain to the Sigstore root, and that the signer's
+  identity matches the allowlist provisioned into the device's NVS.
 - On verify-pass, streams the layer to the inactive OTA partition,
   reboots, and only marks the new image valid after Wi-Fi + registry
   bringup checks pass. Any post-OTA failure auto-rolls back via the
@@ -54,7 +53,7 @@ Subsequent builds are fast.
 
 The OTA-distributed firmware **contains no secrets** — Wi-Fi creds and
 trust roots live in NVS, written via USB by `make provision`. See
-[`provisioning-plan.md`](provisioning-plan.md) for the full design.
+[`ota.md`](ota.md) for the full design.
 
 ## Day-to-day
 
