@@ -50,13 +50,19 @@ Python venv inside it. Plan on 5–10 minutes. Subsequent builds are fast.
 
 ```
 make build      Compile (requires wifi.env)
-make flash      Build (if needed) and flash to PORT
+make flash      Build (if needed) and flash app to PORT
+make flash-all  Erase + write bootloader, partition table, and app
 make monitor    Open serial monitor; Ctrl+C to exit
 make run        Build + flash + monitor
 make clean      cargo clean
 
 make flash PORT=/dev/cu.usbserial-XXXX   # override the port
 ```
+
+Use `make flash-all` after partition-table changes, or as the recovery
+path if both OTA slots end up bad and the bootloader can't auto-revert
+(see "USB recovery" in [`ota-plan.md`](ota-plan.md)). Day-to-day use is
+just `make flash` or `make run`.
 
 ## What the firmware does
 

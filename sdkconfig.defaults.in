@@ -1,0 +1,21 @@
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=7000
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+
+# HTTPS via ESP-IDF's bundled root CA store (esp_crt_bundle_attach in main.rs)
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
+# OTA: custom partition table with two app slots, plus app-rollback support
+# so a bad OTA can be reverted by the bootloader on next boot.
+CONFIG_PARTITION_TABLE_CUSTOM=y
+# Absolute path because IDF resolves this relative to its CMake project,
+# which for embuild is the synthetic project under target/, not our repo
+# root. The Makefile generates sdkconfig.defaults from this template
+# (sdkconfig.defaults.in), substituting @PROJECT_DIR@ at build time.
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="@PROJECT_DIR@/partitions.csv"
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# Inland board has 4MB flash; default IDF assumes 2MB which is too small
+# for our 1.5MB-each OTA partition layout.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"

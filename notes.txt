@@ -80,6 +80,31 @@ wildcards over the date-stamped subdirectories so espup version bumps
 don't require editing the file. Keeps the env close to the build steps
 that need it.
 
+Custom partition table path resolution
+--------------------------------------
+ESP-IDF resolves `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME` relative to
+its top-level CMake project's source dir. For embuild's synthetic IDF
+project, that's `target/.../esp-idf-sys-<hash>/out/`, not our repo root.
+A bare `"partitions.csv"` in sdkconfig therefore fails:
+  ninja: error: '.../out/partitions.csv', needed by 'partition-table.bin', missing
+
+Workaround we settled on: keep `sdkconfig.defaults.in` checked in with
+the placeholder `@PROJECT_DIR@/partitions.csv`, and have the Makefile
+substitute the absolute path at build time, writing the real
+`sdkconfig.defaults` (gitignored). The .in template is committed so
+anyone cloning the repo gets the right shape; the resolved sdkconfig
+is per-machine.
+
+Other things tried that didn't pan out:
+- Putting partitions.csv at the repo root and hoping IDF would walk up
+  to find it — it doesn't.
+- `[package.metadata.esp-idf-sys] esp_idf_sdkconfig_defaults = [...]`
+  with a generated absolute-path file — chicken-and-egg with build
+  ordering (esp-idf-sys's build.rs runs before any file we'd write).
+- Pre-copying partitions.csv into the synthetic project's `out/` from
+  the Makefile — works, but only after the synthetic project has been
+  created at least once, requiring an awkward two-build first run.
+
 Onboard LED — there isn't one on this board
 -------------------------------------------
 The Inland ESP-WROOM-32 we have (Micro Center SKU 027466, rebadged

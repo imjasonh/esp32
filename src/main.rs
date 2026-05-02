@@ -8,6 +8,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
 };
+use std::ffi::CStr;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASS: &str = env!("WIFI_PASS");
@@ -16,6 +17,7 @@ fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
+    log_running_partition();
     log::info!("booting");
 
     let peripherals = Peripherals::take()?;
@@ -38,6 +40,23 @@ fn main() -> Result<()> {
     log::info!("done; idling. ctrl-r in espflash to reset.");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(60));
+    }
+}
+
+fn log_running_partition() {
+    unsafe {
+        let part = esp_idf_svc::sys::esp_ota_get_running_partition();
+        if part.is_null() {
+            log::warn!("running partition: <null>");
+            return;
+        }
+        let label = CStr::from_ptr((*part).label.as_ptr()).to_string_lossy();
+        log::info!(
+            "running partition: {} (offset=0x{:x}, size=0x{:x})",
+            label,
+            (*part).address,
+            (*part).size,
+        );
     }
 }
 

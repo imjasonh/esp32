@@ -34,7 +34,8 @@ WIFI_ENV := . ./wifi.env
 help:
 	@echo "Targets:"
 	@echo "  make build     Compile firmware (requires wifi.env)"
-	@echo "  make flash     Build (if needed) and flash to $(PORT)"
+	@echo "  make flash     Build (if needed) and flash app to $(PORT)"
+	@echo "  make flash-all Erase + write bootloader, partition table, app"
 	@echo "  make monitor   Open serial monitor on $(PORT)  (Ctrl+C to exit)"
 	@echo "  make run       Build + flash + monitor"
 	@echo "  make clean     cargo clean"
@@ -42,8 +43,15 @@ help:
 	@echo ""
 	@echo "Override the port: make flash PORT=/dev/cu.usbserial-XXXX"
 
-build: wifi.env ensure-python-shim
+build: wifi.env ensure-python-shim sdkconfig.defaults
 	$(WIFI_ENV) && cargo build --release
+
+# sdkconfig.defaults is generated from the .in template so we can substitute
+# the absolute project path into CONFIG_PARTITION_TABLE_CUSTOM_FILENAME
+# (IDF resolves it relative to the embuild synthetic project, not our repo
+# root, so a bare "partitions.csv" doesn't work). Gitignored.
+sdkconfig.defaults: sdkconfig.defaults.in partitions.csv
+	@sed 's|@PROJECT_DIR@|$(CURDIR)|g' sdkconfig.defaults.in > sdkconfig.defaults
 
 # Idempotent: creates $(PYTHON_SHIM) and (re)points python3 at the current
 # uv-managed 3.12 interpreter. Auto-installs Python 3.12 via uv if missing.
@@ -56,6 +64,20 @@ ensure-python-shim:
 
 flash: build
 	espflash flash --port $(PORT) $(BIN)
+
+# Full reflash: erase entire flash, then write bootloader + partition table
+# + app. Use this when the partition table changes (phase 0 of OTA), or as
+# the recovery path if both OTA slots are bad and anti-bricking failed.
+# After erase, otadata is empty and the bootloader picks ota_0 by default.
+BOOTLOADER := $(firstword $(wildcard target/xtensa-esp32-espidf/release/build/esp-idf-sys-*/out/build/bootloader/bootloader.bin))
+
+flash-all: build
+	@test -n "$(BOOTLOADER)" || { echo "ERROR: bootloader.bin not found under target/. Run 'make build' first."; exit 1; }
+	espflash erase-flash --port $(PORT)
+	espflash flash --port $(PORT) \
+	    --bootloader $(BOOTLOADER) \
+	    --partition-table partitions.csv \
+	    $(BIN)
 
 monitor:
 	espflash monitor --port $(PORT)

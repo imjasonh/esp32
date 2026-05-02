@@ -2,3 +2,4 @@
 /.embuild
 Cargo.lock
 wifi.env
+sdkconfig.defaults
