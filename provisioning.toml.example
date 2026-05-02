@@ -27,3 +27,14 @@ issuer = "https://accounts.google.com"
 [[trust.identities]]
 identity = "https://github.com/imjasonh/esp32/.github/workflows/publish.yml@refs/heads/main"
 issuer = "https://token.actions.githubusercontent.com"
+
+# Optional. If absent, the device boots with serial-only logging and
+# never tries to talk to GCP. Uncomment + fill in to enable shipping
+# tracing events (app + OTA) to Google Cloud Logging.
+#
+# [gcp]
+# project_id = "my-logs-project"
+# sa_email = "esp32-logger@my-logs-project.iam.gserviceaccount.com"
+# sa_key_id = "abc123..."           # the `private_key_id` field from the SA JSON key
+# sa_key_pem = "gcp-sa-key.pem"     # path to the PKCS#8 RSA private key PEM
+# min_severity = "info"             # trace / debug / info / warn / error

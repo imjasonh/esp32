@@ -91,7 +91,17 @@ ota     poll_secs       u32    optional override (default 60)
 trust   identities      blob   JSON: [{"identity":"...","issuer":"..."}, ...]
 trust   fulcio_root     blob   PEM bytes (Sigstore root CA)
 trust   fulcio_inter    blob   PEM bytes (Sigstore intermediate CA)
+
+gcp     project_id      str    optional; cloud-logging GCP project
+gcp     sa_email        str    optional; logging service-account email
+gcp     sa_key_id       str    optional; key id for the JWT `kid` header
+gcp     sa_key_pem      blob   optional; RSA private key PKCS#8 PEM
+gcp     min_severity    u8     optional; 0=TRACE..4=ERROR (default 2=INFO)
 ```
+
+The `gcp` namespace is opt-in. If any required key is missing, the
+device boots with serial-only logging and never talks to GCP. See
+[`logs-plan.md`](logs-plan.md).
 
 The `wifi` and `trust` namespaces are written by `make provision` and
 never touched by OTA. The `ota` namespace is written at runtime by the
