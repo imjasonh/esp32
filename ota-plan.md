@@ -202,7 +202,7 @@ Deferred (low value, or needs hardware/provisioning we don't have yet):
 
 Split into three sub-phases because the full thing is a real subproject.
 
-#### Phase 4a — sign + verify signature, no Rekor
+#### Phase 4a — sign + verify signature, no Rekor ✅ DONE
 
 - **Publisher**: `cosign sign` runs after each `make publish` push.
   Keyless OIDC flow (browser the first time, cached after). Sigs are
@@ -261,6 +261,6 @@ Split into three sub-phases because the full thing is a real subproject.
 2. Phase 1 publisher. ✅
 3. Phase 2 firmware OTA loop. ✅
 4. Phase 3 polish. ✅ (partial; some deferred)
-5. Phase 4a signing + verify (no Rekor).
+5. Phase 4a signing + verify (no Rekor). ✅
 6. Phase 4b Rekor SET verification.
 7. Phase 4c operational hardening.
