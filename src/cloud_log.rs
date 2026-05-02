@@ -57,10 +57,22 @@ pub struct GcpConfig {
 impl GcpConfig {
     /// Load from NVS. `Ok(None)` means the device is intentionally not
     /// configured for cloud logging (cloud logging is opt-in, missing
-    /// keys = disabled, no error).
+    /// keys or missing namespace = disabled, no error).
     pub fn load(partition: EspDefaultNvsPartition) -> Result<Option<Self>> {
-        let nvs = EspNvs::new(partition, NVS_GCP_NS, false)
-            .map_err(|e| anyhow!("open NVS namespace {}: {:?}", NVS_GCP_NS, e))?;
+        let nvs = match EspNvs::new(partition, NVS_GCP_NS, false) {
+            Ok(n) => n,
+            Err(e)
+                if e.code() == esp_idf_svc::sys::ESP_ERR_NVS_NOT_FOUND as i32 =>
+            {
+                // Namespace has never been written. Cloud logging is
+                // opt-in; this is the normal state for a device that
+                // wasn't provisioned with a [gcp] block.
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(anyhow!("open NVS namespace {}: {:?}", NVS_GCP_NS, e));
+            }
+        };
 
         let project_id = read_str(&nvs, NVS_PROJECT_ID, 96)?;
         let sa_email = read_str(&nvs, NVS_SA_EMAIL, 128)?;
@@ -349,7 +361,7 @@ pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
         if token.as_ref().map_or(true, |t| t.expired_or_close()) {
             match mint_access_token(&cfg, &signing_key) {
                 Ok(t) => {
-                    tracing::info!(
+                    tracing::debug!(
                         expires_in_secs = t.expires_at_unix.saturating_sub(now_unix_secs().unwrap_or(0)),
                         "cloud_log: minted new access token",
                     );
@@ -370,7 +382,7 @@ pub fn run(cfg: GcpConfig, queue: LogQueue) -> ! {
         let bearer = &token.as_ref().unwrap().token;
         match post_batch(&log_name, &cfg.project_id, &mac, bearer, &batch) {
             Ok(()) => {
-                tracing::info!(
+                tracing::debug!(
                     entries = batch.len(),
                     "cloud_log: posted batch",
                 );
@@ -409,7 +421,13 @@ impl CachedToken {
 }
 
 fn parse_signing_key(pem_bytes: &[u8]) -> Result<SigningKey<sha2::Sha256>> {
-    let pem_str = std::str::from_utf8(pem_bytes).context("SA key PEM is not UTF-8")?;
+    // Trim trailing whitespace — jq -r adds a final newline on top of
+    // the PEM's own trailing newline, and pem-rfc7468 then tries to
+    // parse a second (empty) block and errors at "pre-encapsulation
+    // boundary". Tolerate both forms.
+    let pem_str = std::str::from_utf8(pem_bytes)
+        .context("SA key PEM is not UTF-8")?
+        .trim();
     let key = RsaPrivateKey::from_pkcs8_pem(pem_str).context("parse SA PKCS#8 private key")?;
     Ok(SigningKey::<sha2::Sha256>::new(key))
 }

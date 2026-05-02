@@ -120,7 +120,7 @@ pub fn run(
         } else {
             jittered(cfg.poll_interval)
         };
-        tracing::info!(
+        tracing::debug!(
             sleep_secs = sleep_for.as_secs(),
             failures = consecutive_failures,
             "ota: sleeping",
@@ -129,7 +129,7 @@ pub fn run(
         match poll_once(&mut nvs, &cfg, &trust) {
             Ok(PollOutcome::NoChange) => {
                 consecutive_failures = 0;
-                tracing::info!("ota: no change");
+                tracing::debug!("ota: no change");
             }
             Ok(PollOutcome::Updated(d)) => {
                 tracing::info!(digest = %d, "ota: applied, rebooting in 1s");
@@ -193,7 +193,7 @@ fn poll_once(
     if layer.media_type != "application/vnd.esp32.firmware.bin" {
         bail!("unexpected layer mediaType: {}", layer.media_type);
     }
-    tracing::info!(
+    tracing::debug!(
         manifest_digest = %format!("sha256:{}", manifest_digest_hex),
         layer_digest = %layer.digest,
         size = layer.size,
