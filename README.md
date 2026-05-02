@@ -2,6 +2,8 @@
 
 Std Rust on an Inland ESP-WROOM-32 dev board. Currently a Wi-Fi + HTTPS
 demo; e-ink display work coming next (see [`eink-plan.md`](eink-plan.md)).
+There's also a note on the feasibility of a future `no_std` + `esp-hal`
+port in [`no-std-investigation.md`](no-std-investigation.md).
 
 ## Hardware
 
@@ -110,6 +112,7 @@ rust-toolchain.toml    pins the `esp` rustc toolchain
 sdkconfig.defaults     ESP-IDF kconfig overrides (stack, mbedtls bundle)
 Makefile               canonical build / flash / monitor entrypoint
 wifi.env.example       template for compile-time Wi-Fi creds
+no-std-investigation.md findings on a possible no_std + esp-hal port
 eink-plan.md           plan for the upcoming e-ink display work
 ota-plan.md            plan for OCI-artifact-based OTA updates
 tools/publisher/       Rust tool that pushes firmware as an OCI artifact
