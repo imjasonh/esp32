@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
+use embedded_svc::http::client::Client;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
-use embedded_svc::http::client::Client;
 use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
 use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
@@ -12,6 +12,8 @@ use std::ffi::CStr;
 use std::time::Duration;
 
 mod cloud_log;
+mod gcp_auth;
+mod metrics;
 mod ota;
 mod sig;
 mod trust;
@@ -29,6 +31,7 @@ const FW_VERSION: &str = env!("GIT_SHA");
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    metrics::publish_self(&metrics::handles::MAIN);
 
     // Take NVS as early as possible — needed to decide whether to
     // install the cloud-log tracing subscriber, *before* any tracing
@@ -69,9 +72,7 @@ fn main() -> Result<()> {
     };
     let trust = match trust::TrustConfig::load(nvs.clone())? {
         Some(t) => t,
-        None => block_unprovisioned(
-            "trust/identities or trust/fulcio_{root,inter} missing in NVS",
-        ),
+        None => block_unprovisioned("trust/identities or trust/fulcio_{root,inter} missing in NVS"),
     };
     tracing::info!(
         identities = trust.identities.len(),
@@ -148,11 +149,44 @@ fn main() -> Result<()> {
         .expect("spawn ota thread");
 
     if let (Some(cfg), Some(queue)) = (gcp, log_queue) {
-        std::thread::Builder::new()
-            // RSA signing + HTTPS POST. 32 KB matches the OTA loop budget.
-            .stack_size(32 * 1024)
-            .spawn(move || cloud_log::run(cfg, queue))
-            .expect("spawn cloud_log thread");
+        // Build the shared TokenProvider once — both cloud_log and
+        // metrics get an Arc clone and share the cached access token
+        // (multi-scope JWT covers both APIs). Parsing the SA key at
+        // construction time means a malformed key fails fast here
+        // rather than once per minute in the sender thread.
+        let auth = match gcp_auth::TokenProvider::new(cfg.clone()) {
+            Ok(a) => Some(std::sync::Arc::new(a)),
+            Err(e) => {
+                tracing::error!(
+                    error = %format!("{:#}", e),
+                    "gcp_auth: TokenProvider init failed; cloud_log + metrics disabled",
+                );
+                None
+            }
+        };
+
+        if let Some(auth) = auth {
+            let cl_cfg = cfg.clone();
+            let cl_auth = auth.clone();
+            let cl_queue = queue.clone();
+            std::thread::Builder::new()
+                // RSA signing + HTTPS POST. 32 KB matches the OTA loop budget.
+                .stack_size(32 * 1024)
+                .spawn(move || cloud_log::run(cl_cfg, cl_auth, cl_queue))
+                .expect("spawn cloud_log thread");
+
+            if cfg.metrics_interval_secs > 0 {
+                let m_cfg = cfg;
+                let m_auth = auth;
+                let m_queue = queue;
+                std::thread::Builder::new()
+                    // No crypto on hot path (token cached via auth).
+                    // Mainly HTTPS POST + serde_json. 16 KB sufficient.
+                    .stack_size(16 * 1024)
+                    .spawn(move || metrics::run(m_cfg, m_auth, m_queue))
+                    .expect("spawn metrics thread");
+            }
+        }
     }
 
     tracing::info!("main: idling, OTA loop running in background");
@@ -186,10 +220,14 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &st
     };
 
     wifi.set_configuration(&WifiConfig::Client(ClientConfiguration {
-        ssid: ssid.try_into().map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
+        ssid: ssid
+            .try_into()
+            .map_err(|_| anyhow!("SSID too long (max 32 bytes)"))?,
         bssid: None,
         auth_method,
-        password: pass.try_into().map_err(|_| anyhow!("password too long (max 64 bytes)"))?,
+        password: pass
+            .try_into()
+            .map_err(|_| anyhow!("password too long (max 64 bytes)"))?,
         channel: None,
         ..Default::default()
     }))?;
@@ -232,7 +270,6 @@ fn block_unprovisioned(reason: &str) -> ! {
     }
 }
 
-
 fn fetch(url: &str) -> Result<()> {
     let conn = EspHttpConnection::new(&HttpConfig {
         crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
@@ -255,7 +292,7 @@ fn fetch(url: &str) -> Result<()> {
         total += n;
         body.extend_from_slice(&buf[..n]);
     }
-    tracing::info!(
+    tracing::debug!(
         url = url,
         status = status,
         bytes = total,
