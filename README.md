@@ -64,6 +64,32 @@ path if both OTA slots end up bad and the bootloader can't auto-revert
 (see "USB recovery" in [`ota-plan.md`](ota-plan.md)). Day-to-day use is
 just `make flash` or `make run`.
 
+## Publishing firmware to GHCR (OTA, phase 1)
+
+The firmware is packaged as an OCI artifact and pushed to
+`ghcr.io/imjasonh/esp32`. The device will pull it back down (phase 2,
+not yet implemented).
+
+One-time setup:
+
+1. Mint a classic PAT at https://github.com/settings/tokens/new with the
+   `write:packages` scope. (Fine-grained PATs don't currently expose a
+   Packages permission for user-owned packages.)
+2. `echo 'export GH_TOKEN=ghp_...' > gh.env` (gitignored)
+3. After the first push, set the package's visibility to public at
+   https://github.com/users/imjasonh/packages/container/esp32/settings —
+   the device will pull anonymously, no token on the ESP32.
+
+Then:
+
+```
+make publish      # build firmware, save .bin, push :latest and :sha-<short>
+```
+
+The publisher tool lives at [`tools/publisher/`](tools/publisher) — Rust,
+uses `oci-distribution`. It's a separate cargo project so it builds for
+the host, not for the ESP32.
+
 ## What the firmware does
 
 `src/main.rs` connects to Wi-Fi using the credentials baked in at compile
@@ -85,5 +111,7 @@ sdkconfig.defaults     ESP-IDF kconfig overrides (stack, mbedtls bundle)
 Makefile               canonical build / flash / monitor entrypoint
 wifi.env.example       template for compile-time Wi-Fi creds
 eink-plan.md           plan for the upcoming e-ink display work
+ota-plan.md            plan for OCI-artifact-based OTA updates
+tools/publisher/       Rust tool that pushes firmware as an OCI artifact
 notes.txt              internal design notes and issues hit during setup
 ```

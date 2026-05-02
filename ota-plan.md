@@ -98,38 +98,30 @@ Shipped:
 - Verified: device boots into `ota_0` at offset `0x20000`, Wi-Fi +
   HTTPS still working. App is 1.15MB / 1.5MB slot (73%).
 
-### Phase 1 — publisher (host-side Rust)
+### Phase 1 — publisher (host-side Rust) ✅ DONE
 
-**Goal**: produce + push an OCI artifact containing the .bin to GHCR.
-
-- New cargo project at `tools/publisher/` with its own `.cargo/config.toml`
-  that does *not* set the xtensa target, so it builds for the host.
-- Crate stack:
-  - `oci-distribution` — the established Rust OCI client (used by
-    krustlet, by stevelr's various tools). Supports manifests, blobs,
-    auth, custom mediatypes.
-  - `clap` — CLI args
-  - `anyhow`, `serde`, `serde_json`, `sha2`, `tokio` (async needed by
-    `oci-distribution`)
-- CLI:
-  ```
-  publisher push \
-      --bin target/.../esp32-firmware.bin \
-      --repo ghcr.io/<user>/esp32-fw \
-      --tag latest \
-      --git-sha $(git rev-parse --short HEAD)
-  ```
-- Mediatypes:
-  - config: `application/vnd.esp32.firmware.v1+json` containing
-    `{target_chip, idf_version, git_sha, built_at}`
-  - layer: `application/vnd.esp32.firmware.bin` (raw .bin, no
-    compression)
-- Push under both `:latest` and `:sha-<short>` so we can pin a fleet to
-  a known-good build by tag.
-- Auth: token from `GH_TOKEN` env var (PAT with `write:packages`).
-- Wire into Makefile: `make publish` does
-  `cargo build --release` → `espflash save-image` → `cd tools/publisher
-  && cargo run --release -- push ...`.
+Shipped:
+- `tools/publisher/` — separate cargo project (with its own
+  `.cargo/config.toml` to clear the parent's `[unstable] build-std`),
+  built via `--target $(HOST_TRIPLE)` so it works on any developer
+  machine without hardcoded triples.
+- Crates: `oci-distribution` (with `rustls-tls`), `clap`, `anyhow`,
+  `serde`, `serde_json`, `sha2`, `tokio`, `tracing`, `time`.
+- Mediatypes: `application/vnd.esp32.firmware.v1+json` (config),
+  `application/vnd.esp32.firmware.bin` (layer). Config carries
+  `{target_chip, idf_version, git_sha, built_at, bin_size, bin_sha256}`.
+- Annotations: `org.opencontainers.image.source`,
+  `org.opencontainers.image.revision`, `org.opencontainers.image.created`.
+- Push subcommand pushes both `:latest` and `:sha-<short>`.
+- Pull-verify subcommand pulls the manifest + layer, checks descriptor
+  digest matches actual blob SHA, and compares to a local file. Doubles
+  as a sketch of the device-side fetch.
+- Auth via `GH_TOKEN` from gitignored `gh.env`. Classic PAT with
+  `write:packages` (fine-grained PATs don't expose a Packages
+  permission for user-owned packages — see notes.txt).
+- Make targets: `save-image`, `publish`, `pull-verify`.
+- Verified end-to-end against `ghcr.io/imjasonh/esp32` — pushed both
+  tags, pulled both back, layer bit-for-bit identical to local .bin.
 
 ### Phase 2 — device-side OTA (firmware)
 

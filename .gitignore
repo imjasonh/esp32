@@ -2,4 +2,6 @@
 /.embuild
 Cargo.lock
 wifi.env
+gh.env
 sdkconfig.defaults
+tools/publisher/target
