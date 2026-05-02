@@ -1,0 +1,339 @@
+//! OTA polling and apply loop. Pulls firmware from an OCI registry,
+//! verifies its layer digest, writes to the inactive OTA slot, and
+//! reboots into the new image. The bootloader's rollback support
+//! reverts on next boot if the new image doesn't call
+//! `mark_valid_after_pending_verify_passed` (see main.rs).
+
+use anyhow::{anyhow, bail, Context, Result};
+use embedded_svc::http::client::Client;
+use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection, FollowRedirectsPolicy};
+use esp_idf_svc::http::Method;
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
+use esp_idf_svc::ota::EspOta;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
+use std::time::Duration;
+
+const NVS_NAMESPACE: &str = "ota";
+const NVS_LAST_DIGEST: &str = "last_digest";
+const NVS_PENDING_DIGEST: &str = "pending_digest";
+
+/// Where to fetch firmware from.
+pub struct OtaConfig {
+    pub repo: String,           // "ghcr.io/imjasonh/esp32"
+    pub tag: String,            // "latest"
+    pub poll_interval: Duration,
+}
+
+impl Default for OtaConfig {
+    fn default() -> Self {
+        Self {
+            repo: "ghcr.io/imjasonh/esp32".into(),
+            tag: "latest".into(),
+            // 60s for development; ota-plan.md targets 600s in steady state.
+            poll_interval: Duration::from_secs(60),
+        }
+    }
+}
+
+/// OCI image manifest, the only fields we care about.
+#[derive(Deserialize)]
+struct Manifest {
+    layers: Vec<Descriptor>,
+}
+
+#[derive(Deserialize)]
+struct Descriptor {
+    digest: String,
+    size: u64,
+    #[serde(rename = "mediaType")]
+    media_type: String,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    token: String,
+}
+
+/// Background loop. Runs forever; never returns. Spawn in a thread.
+pub fn run(nvs_partition: EspDefaultNvsPartition, cfg: OtaConfig) -> ! {
+    let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
+        Ok(n) => n,
+        Err(e) => {
+            log::error!("ota: failed to open NVS namespace: {:?}", e);
+            // Sleep forever rather than crash the app.
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+    };
+
+    log::info!(
+        "ota: polling {}:{} every {}s",
+        cfg.repo,
+        cfg.tag,
+        cfg.poll_interval.as_secs()
+    );
+
+    loop {
+        std::thread::sleep(cfg.poll_interval);
+        match poll_once(&mut nvs, &cfg) {
+            Ok(PollOutcome::NoChange) => log::info!("ota: no change"),
+            Ok(PollOutcome::Updated(d)) => {
+                log::info!("ota: applied {}, rebooting in 1s", d);
+                std::thread::sleep(Duration::from_secs(1));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+            Err(e) => log::warn!("ota: poll failed: {:#}", e),
+        }
+    }
+}
+
+enum PollOutcome {
+    NoChange,
+    Updated(String),
+}
+
+fn poll_once(nvs: &mut EspNvs<NvsDefault>, cfg: &OtaConfig) -> Result<PollOutcome> {
+    let token = fetch_anon_token(&cfg.repo)?;
+
+    // Manifest fetch. We re-fetch every poll (no If-None-Match yet — the
+    // ESP HTTP client doesn't make that trivial); we do compare the layer
+    // digest from the manifest against last_applied_digest before
+    // downloading the (much larger) layer.
+    let manifest = fetch_manifest(&cfg.repo, &cfg.tag, &token)?;
+    let layer = manifest
+        .layers
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("manifest has no layers"))?;
+    if layer.media_type != "application/vnd.esp32.firmware.bin" {
+        bail!("unexpected layer mediaType: {}", layer.media_type);
+    }
+    log::info!(
+        "ota: manifest layer digest={} size={}",
+        layer.digest,
+        layer.size
+    );
+
+    let last = read_string(nvs, NVS_LAST_DIGEST).unwrap_or_default();
+    if last == layer.digest {
+        return Ok(PollOutcome::NoChange);
+    }
+    log::info!("ota: new digest (was {}), downloading", if last.is_empty() { "<none>" } else { &last });
+
+    download_and_apply(&cfg.repo, &layer, &token)?;
+
+    // Persist as pending; main.rs will promote to last_digest after the
+    // post-reboot pending-verify check passes.
+    write_string(nvs, NVS_PENDING_DIGEST, &layer.digest)?;
+    Ok(PollOutcome::Updated(layer.digest))
+}
+
+fn fetch_anon_token(repo: &str) -> Result<String> {
+    // Strip the "ghcr.io/" prefix; the token endpoint wants "<owner>/<name>".
+    let repo_path = repo
+        .strip_prefix("ghcr.io/")
+        .ok_or_else(|| anyhow!("only ghcr.io is supported for now (got {})", repo))?;
+    let url = format!(
+        "https://ghcr.io/token?service=ghcr.io&scope=repository:{}:pull",
+        repo_path
+    );
+
+    let mut buf = Vec::with_capacity(1024);
+    fetch_to_buf(&url, &[], &mut buf)?;
+    let resp: TokenResponse =
+        serde_json::from_slice(&buf).context("parse token response JSON")?;
+    Ok(resp.token)
+}
+
+fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<Manifest> {
+    let repo_path = repo
+        .strip_prefix("ghcr.io/")
+        .ok_or_else(|| anyhow!("only ghcr.io is supported for now (got {})", repo))?;
+    let url = format!("https://ghcr.io/v2/{}/manifests/{}", repo_path, tag);
+    let auth = format!("Bearer {}", token);
+
+    let mut buf = Vec::with_capacity(4096);
+    fetch_to_buf(
+        &url,
+        &[
+            ("authorization", auth.as_str()),
+            (
+                "accept",
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+        ],
+        &mut buf,
+    )?;
+    let m: Manifest = serde_json::from_slice(&buf)
+        .with_context(|| format!("parse manifest JSON ({} bytes)", buf.len()))?;
+    Ok(m)
+}
+
+fn fetch_to_buf(url: &str, headers: &[(&str, &str)], buf: &mut Vec<u8>) -> Result<()> {
+    let conn = EspHttpConnection::new(&HttpConfig {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        follow_redirects_policy: FollowRedirectsPolicy::FollowAll,
+        timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    })?;
+    let mut client = Client::wrap(conn);
+    let req = client.request(Method::Get, url, headers)?;
+    let mut resp = req.submit()?;
+    let status = resp.status();
+    if status != 200 {
+        bail!("GET {} -> {}", url, status);
+    }
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = resp.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    Ok(())
+}
+
+fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()> {
+    let repo_path = repo
+        .strip_prefix("ghcr.io/")
+        .ok_or_else(|| anyhow!("only ghcr.io is supported"))?;
+    let url = format!("https://ghcr.io/v2/{}/blobs/{}", repo_path, layer.digest);
+    let auth = format!("Bearer {}", token);
+
+    let conn = EspHttpConnection::new(&HttpConfig {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        follow_redirects_policy: FollowRedirectsPolicy::FollowAll,
+        timeout: Some(Duration::from_secs(120)),
+        buffer_size: Some(4096),
+        ..Default::default()
+    })?;
+    let mut client = Client::wrap(conn);
+    let headers = [
+        ("authorization", auth.as_str()),
+        ("accept", "application/octet-stream"),
+    ];
+    let req = client.request(Method::Get, &url, &headers)?;
+    let mut resp = req.submit()?;
+    if resp.status() != 200 {
+        bail!("blob GET {} -> {}", url, resp.status());
+    }
+
+    let mut ota = EspOta::new().context("EspOta::new")?;
+    let mut update = ota.initiate_update().context("initiate OTA update")?;
+
+    let expected_sha_hex = layer
+        .digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| anyhow!("non-sha256 digest: {}", layer.digest))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 4096];
+    let mut total: u64 = 0;
+    let mut next_log = 256u64 * 1024;
+    loop {
+        let n = resp.read(&mut buf).context("read blob chunk")?;
+        if n == 0 {
+            break;
+        }
+        update.write(&buf[..n]).context("OTA write")?;
+        hasher.update(&buf[..n]);
+        total += n as u64;
+        if total >= next_log {
+            log::info!("ota: wrote {}/{} bytes", total, layer.size);
+            next_log += 256 * 1024;
+        }
+    }
+    if total != layer.size {
+        update.abort().ok();
+        bail!("blob size mismatch: got {}, expected {}", total, layer.size);
+    }
+    let actual_sha_hex = format!("{:x}", hasher.finalize());
+    if actual_sha_hex != expected_sha_hex {
+        update.abort().ok();
+        bail!(
+            "blob SHA mismatch: got {}, manifest says {}",
+            actual_sha_hex,
+            expected_sha_hex
+        );
+    }
+    log::info!("ota: download complete, SHA verified, finalizing");
+    update.complete().context("OTA complete (set boot partition)")?;
+    Ok(())
+}
+
+fn read_string(nvs: &EspNvs<NvsDefault>, key: &str) -> Option<String> {
+    let mut buf = [0u8; 96];
+    match nvs.get_str(key, &mut buf) {
+        Ok(Some(s)) => Some(s.to_string()),
+        _ => None,
+    }
+}
+
+fn write_string(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &str) -> Result<()> {
+    nvs.set_str(key, value)
+        .with_context(|| format!("write NVS key {}", key))
+}
+
+/// On boot, before we connect Wi-Fi, check whether we're in pending-verify
+/// state. Returns true if so (caller must run bringup checks and then call
+/// `mark_valid_after_pending_verify_passed` or reboot to roll back).
+pub fn is_pending_verify() -> bool {
+    use esp_idf_svc::sys::*;
+    unsafe {
+        let part = esp_ota_get_running_partition();
+        if part.is_null() {
+            return false;
+        }
+        let mut state: esp_ota_img_states_t = 0;
+        let err = esp_ota_get_state_partition(part, &mut state);
+        if err != ESP_OK {
+            log::warn!("ota: esp_ota_get_state_partition err={}", err);
+            return false;
+        }
+        log::info!(
+            "ota: running partition state = {} ({})",
+            state,
+            ota_state_name(state)
+        );
+        state == esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY
+    }
+}
+
+/// Call after the post-OTA bringup checks passed: marks the running app
+/// as valid (cancels rollback) and promotes pending_digest -> last_digest.
+pub fn mark_valid_after_pending_verify_passed(
+    nvs_partition: EspDefaultNvsPartition,
+) -> Result<()> {
+    use esp_idf_svc::sys::*;
+    let err = unsafe { esp_ota_mark_app_valid_cancel_rollback() };
+    if err != ESP_OK {
+        bail!("esp_ota_mark_app_valid_cancel_rollback err={}", err);
+    }
+    log::info!("ota: marked app valid, rollback cancelled");
+
+    let mut nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)
+        .context("open ota NVS namespace")?;
+    if let Some(pending) = read_string(&nvs, NVS_PENDING_DIGEST) {
+        write_string(&mut nvs, NVS_LAST_DIGEST, &pending)?;
+        // Best-effort clear of pending; not fatal if it fails.
+        let _ = nvs.remove(NVS_PENDING_DIGEST);
+        log::info!("ota: promoted pending {} -> last_digest", pending);
+    }
+    Ok(())
+}
+
+fn ota_state_name(s: esp_idf_svc::sys::esp_ota_img_states_t) -> &'static str {
+    use esp_idf_svc::sys::*;
+    match s {
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_NEW => "NEW",
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_PENDING_VERIFY => "PENDING_VERIFY",
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_VALID => "VALID",
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_INVALID => "INVALID",
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_ABORTED => "ABORTED",
+        s if s == esp_ota_img_states_t_ESP_OTA_IMG_UNDEFINED => "UNDEFINED",
+        _ => "?",
+    }
+}
+

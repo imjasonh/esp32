@@ -20,6 +20,11 @@ FW_BIN := target/firmware.bin
 # OCI artifact destination.
 OCI_REPO ?= ghcr.io/imjasonh/esp32
 
+# Short git SHA, baked into the firmware via env!() (see build.rs + main.rs)
+# and used as the secondary OCI tag on publish.
+GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+export GIT_SHA
+
 # Toolchain paths installed by `espup install --targets esp32`. The
 # wildcards absorb the date-stamped subdirectory names so espup upgrades
 # don't require editing this file.
@@ -94,7 +99,7 @@ flash-all: build
 	    $(BIN)
 
 monitor:
-	espflash monitor --port $(PORT)
+	espflash monitor --port $(PORT) $(if $(MAKE_TERMOUT),,--non-interactive)
 
 run: build
 	espflash flash --port $(PORT) --monitor $(BIN)
@@ -117,7 +122,7 @@ publish: $(FW_BIN) check-gh-env
 	. ./gh.env && cd tools/publisher && cargo run --release --target $(HOST_TRIPLE) -- push \
 	    --bin $(CURDIR)/$(FW_BIN) \
 	    --repo $(OCI_REPO) \
-	    --git-sha $$(git rev-parse --short HEAD)
+	    --git-sha $(GIT_SHA)
 
 # Pull the latest artifact from OCI_REPO and verify its layer SHA matches
 # our locally-built firmware. Confirms the round trip works and exercises

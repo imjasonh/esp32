@@ -123,48 +123,43 @@ Shipped:
 - Verified end-to-end against `ghcr.io/imjasonh/esp32` — pushed both
   tags, pulled both back, layer bit-for-bit identical to local .bin.
 
-### Phase 2 — device-side OTA (firmware)
+### Phase 2 — device-side OTA (firmware) ✅ DONE
 
-**Goal**: the device polls, downloads, applies, and self-validates.
+Shipped:
+- `src/ota.rs` — background polling loop on a dedicated 32 KB pthread.
+  Every 60s: get a Bearer token from the GHCR token endpoint
+  (anonymous, scoped to `repository:<repo>:pull`), fetch the manifest,
+  compare the layer digest to `last_digest` in NVS, and on mismatch
+  stream the blob into the inactive OTA partition while computing
+  SHA256 in parallel. Aborts the OTA update and bails on size or SHA
+  mismatch. On success persists `pending_digest` to NVS and reboots.
+- `main.rs` — on every boot:
+  - Reads the partition state via `esp_ota_get_state_partition()`.
+  - If `PENDING_VERIFY`, runs the existing bringup checks (Wi-Fi +
+    HTTPS to ipify + wttr) before calling
+    `esp_ota_mark_app_valid_cancel_rollback()`. If mark-valid fails,
+    reboots so the bootloader rolls back.
+  - Promotes `pending_digest` → `last_digest` in NVS after mark-valid.
+  - Spawns the OTA loop.
+- `FW_VERSION` is the short git SHA, baked in at compile time
+  (`build.rs` reads `GIT_SHA` env var set by the Makefile) and logged
+  on every boot.
+- `CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT` raised to 16 KB; OTA thread
+  takes 32 KB explicitly. 8 KB stack-overflowed during HTTPS + JSON +
+  SHA work.
+- `make monitor` now auto-passes `--non-interactive` when stdout is
+  not a TTY, so it works inside scripts and background tasks.
+- Verified end-to-end: published v1, flashed via USB; bumped a visible
+  version string; `make publish`; the device polled, downloaded,
+  SHA-verified, rebooted into `ota_1`, and marked the new image valid
+  after bringup — zero USB intervention.
 
-- New module `src/ota.rs`. Spawn a background task on boot:
-  ```
-  loop {
-      sleep(poll_interval_from_nvs);
-      match poll_and_maybe_update() {
-          Ok(Updated) => esp_restart(),  // boots into pending-verify
-          Ok(NoChange) => {},
-          Err(e) => { log::warn!(...); backoff(); },
-      }
-  }
-  ```
-- `poll_and_maybe_update`:
-  1. Get bearer token (anonymous flow — see below).
-  2. GET `/v2/<repo>/manifests/<tag>` with
-     `Accept: application/vnd.oci.image.manifest.v1+json` and
-     `If-None-Match: <last_applied_digest>` from NVS.
-     - 304 → return NoChange.
-     - 200 → parse manifest, extract layer digest from `.layers[0].digest`.
-  3. GET `/v2/<repo>/blobs/<layer-digest>`. Stream the body chunk by
-     chunk into `EspOta::write()` (the Rust wrapper around
-     `esp_ota_write`).
-  4. `EspOta::complete()` → set boot partition.
-  5. Persist the new manifest digest as `pending_digest` in NVS.
-  6. Return Updated. The outer loop calls `esp_restart()`.
-- After reboot, in `main()`:
-  - Get running partition via `esp_ota_get_running_partition()`.
-  - Get state via `esp_ota_get_state_partition()`. If
-    `ESP_OTA_IMG_PENDING_VERIFY`, do bringup (Wi-Fi + registry +
-    manifest GET). On success:
-    `esp_ota_mark_app_valid_cancel_rollback()`, copy `pending_digest`
-    → `last_applied_digest`. On failure: `esp_restart()` and let the
-    bootloader roll back.
-- Anonymous-token flow:
-  - First request returns 401 with
-    `WWW-Authenticate: Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:<repo>:pull"`.
-  - GET that realm with the scope, parse `{token: ...}`, use as
-    `Authorization: Bearer <token>` for subsequent requests. Cache
-    the token; refresh on 401.
+Deferred to phase 3:
+- `If-None-Match` to avoid re-fetching unchanged manifests
+- Backoff + jitter on registry errors
+- NVS-configurable poll interval / repo / tag (currently compile-time
+  defaults: `ghcr.io/imjasonh/esp32:latest`, 60s)
+- Force-update GPIO button
 
 ### Phase 3 — operational glue
 

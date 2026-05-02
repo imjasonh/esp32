@@ -9,23 +9,34 @@ use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
 };
 use std::ffi::CStr;
+use std::time::Duration;
+
+mod ota;
 
 const SSID: &str = env!("WIFI_SSID");
 const PASS: &str = env!("WIFI_PASS");
+// Set by the Makefile from `git rev-parse --short HEAD` and baked into
+// the firmware so each build identifies itself in the boot log.
+const FW_VERSION: &str = env!("GIT_SHA");
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
 
     log_running_partition();
-    log::info!("booting");
+    log::info!("booting firmware version: {}", FW_VERSION);
+
+    let pending_verify = ota::is_pending_verify();
+    if pending_verify {
+        log::info!("ota: this image is in PENDING_VERIFY -- bringup must succeed before mark-valid");
+    }
 
     let peripherals = Peripherals::take()?;
     let sysloop = EspSystemEventLoop::take()?;
     let nvs = EspDefaultNvsPartition::take()?;
 
     let mut wifi = BlockingWifi::wrap(
-        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs))?,
+        EspWifi::new(peripherals.modem, sysloop.clone(), Some(nvs.clone()))?,
         sysloop,
     )?;
 
@@ -37,9 +48,29 @@ fn main() -> Result<()> {
     fetch("https://api.ipify.org?format=json")?;
     fetch("https://wttr.in/?format=3")?;
 
-    log::info!("done; idling. ctrl-r in espflash to reset.");
+    if pending_verify {
+        match ota::mark_valid_after_pending_verify_passed(nvs.clone()) {
+            Ok(()) => log::info!("ota: pending-verify passed, image is good"),
+            Err(e) => {
+                log::error!("ota: mark-valid failed: {:#}; rebooting to trigger rollback", e);
+                std::thread::sleep(Duration::from_secs(2));
+                unsafe { esp_idf_svc::sys::esp_restart() };
+            }
+        }
+    }
+
+    let ota_nvs = nvs.clone();
+    std::thread::Builder::new()
+        // OTA work is HTTPS + JSON parse + SHA256 on a streaming download;
+        // mbedtls alone wants several KB. 32 KB has headroom; observed
+        // failures at 8 KB.
+        .stack_size(32 * 1024)
+        .spawn(move || ota::run(ota_nvs, ota::OtaConfig::default()))
+        .expect("spawn ota thread");
+
+    log::info!("main: idling, OTA loop running in background");
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(60));
+        std::thread::sleep(Duration::from_secs(3600));
     }
 }
 

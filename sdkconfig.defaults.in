@@ -1,5 +1,7 @@
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=7000
-CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=8192
+# Default for std::thread::spawn() without explicit stack_size. Bumped from
+# 8192 because anything that does HTTPS + JSON + SHA blows past 8 KB.
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384
 
 # HTTPS via ESP-IDF's bundled root CA store (esp_crt_bundle_attach in main.rs)
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
