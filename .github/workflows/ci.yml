@@ -34,7 +34,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
 
       - name: Setup uv (for python-shim)
-        uses: astral-sh/setup-uv@v8
+        uses: astral-sh/setup-uv@v7
 
       - name: Setup Xtensa toolchain (espup)
         uses: esp-rs/xtensa-toolchain@v1.7
