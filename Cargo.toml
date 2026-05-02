@@ -11,6 +11,10 @@ harness = false
 
 [profile.release]
 opt-level = "s"
+lto = true            # link-time optimization across all crates
+codegen-units = 1     # one CGU = more cross-fn opt at the cost of build speed
+strip = true          # drop ELF symbols not needed at runtime
+panic = "abort"       # smaller panic handler; matches build-std=panic_abort
 
 [profile.dev]
 debug = true

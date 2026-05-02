@@ -8,17 +8,18 @@
 #   0x009000-0x00EFFF  nvs         (24 KB)
 #   0x00F000-0x010FFF  otadata     (8 KB)   - which slot to boot
 #   0x011000-0x011FFF  phy_init    (4 KB)
-#   0x020000-0x1DFFFF  ota_0       (1.75 MB)
-#   0x1E0000-0x39FFFF  ota_1       (1.75 MB)
-#   0x3A0000-0x3FFFFF  unused      (384 KB)
+#   0x020000-0x20FFFF  ota_0       (1.9375 MB)
+#   0x210000-0x3FFFFF  ota_1       (1.9375 MB)
 #
-# Bumped from 1.5 MB slots to 1.75 MB when phase 4a (cosign signature
-# verification) pushed the firmware past 1.5 MB. Repartitioning is a
-# USB-only migration (`make flash-all`).
+# Bumped from 1.75 MB to 1.9375 MB slots so we can absorb future feature
+# work (e-ink driver, more crates) without immediately running out. There
+# is no unused space left at the end of flash; if we need it later (extra
+# nvs, spiffs, etc.) we'd have to shrink slots again. Repartitioning is
+# a USB-only migration (`make flash-all`).
 #
-# Name,    Type, SubType, Offset,   Size
-nvs,      data, nvs,     0x9000,   0x6000
-otadata,  data, ota,     0xf000,   0x2000
-phy_init, data, phy,     0x11000,  0x1000
-ota_0,    app,  ota_0,   0x20000,  0x1C0000
-ota_1,    app,  ota_1,   0x1E0000, 0x1C0000
+# Name,    Type, SubType, Offset,    Size
+nvs,      data, nvs,     0x9000,    0x6000
+otadata,  data, ota,     0xf000,    0x2000
+phy_init, data, phy,     0x11000,   0x1000
+ota_0,    app,  ota_0,   0x20000,   0x1F0000
+ota_1,    app,  ota_1,   0x210000,  0x1F0000
