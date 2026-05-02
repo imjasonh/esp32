@@ -1,0 +1,86 @@
+name: CI
+
+# Build verification on PRs (and pushes to main, redundantly with the
+# publish workflow but harmless and gives faster feedback).
+#
+# No publishing or signing — that's publish.yml's job. This workflow
+# just confirms the code compiles for both targets (esp32 firmware
+# and the host-side publisher tool).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Per-PR concurrency: a new push to a branch cancels the in-flight CI
+# for older commits on the same branch. Doesn't affect other PRs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    name: build firmware
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cmake + ninja
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Setup uv (for python-shim)
+        uses: astral-sh/setup-uv@v8
+
+      - name: Setup Xtensa toolchain (espup)
+        uses: esp-rs/xtensa-toolchain@v1.7
+        with:
+          default: true
+          buildtargets: esp32
+          ldproxy: true
+
+      - name: Cache .embuild (ESP-IDF + tools)
+        uses: actions/cache@v5
+        with:
+          path: .embuild
+          key: embuild-v5.2.2-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
+          restore-keys: |
+            embuild-v5.2.2-${{ runner.os }}-
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-firmware
+
+      - name: Write placeholder wifi.env
+        # The firmware embeds WIFI_SSID/WIFI_PASS at compile time via
+        # env!() but doesn't validate them. CI just needs the build to
+        # succeed; runtime Wi-Fi connect with these placeholders would
+        # fail, but that's not what CI is testing.
+        run: |
+          {
+            echo 'export WIFI_SSID="ci-placeholder"'
+            echo 'export WIFI_PASS="ci-placeholder"'
+          } > wifi.env
+
+      - name: Build firmware
+        run: make build
+
+  publisher:
+    name: build publisher
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/publisher
+          shared-key: ci-publisher
+
+      - name: Build publisher
+        run: cd tools/publisher && cargo build --release
