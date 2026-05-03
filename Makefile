@@ -1,5 +1,5 @@
 # ESP32 Rust — runnable documentation for build / flash / monitor.
-# See notes.txt for one-time setup (espup, brew deps, Python 3.12 shim).
+# See docs/setup.md for one-time setup (espup, brew deps, Python 3.12 shim).
 #
 # Quick start (new device):
 #   make provisioning.toml   # one-time: copy template
@@ -94,7 +94,7 @@ sdkconfig.defaults: sdkconfig.defaults.in partitions.csv
 # back to the shim itself (self-reference) producing ELOOP. Recreating
 # from scratch each run avoids both.
 ensure-python-shim:
-	@command -v uv >/dev/null || { echo "ERROR: uv not installed. See notes.txt step 4."; exit 1; }
+	@command -v uv >/dev/null || { echo "ERROR: uv not installed. See docs/setup.md."; exit 1; }
 	@mkdir -p $(PYTHON_SHIM)
 	@rm -f $(PYTHON_SHIM)/python $(PYTHON_SHIM)/python3
 	@uv python find 3.12 >/dev/null 2>&1 || uv python install 3.12
