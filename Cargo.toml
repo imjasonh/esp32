@@ -50,6 +50,21 @@ base64 = "0.22"
 rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
 # RFC 3339 timestamp formatting for Cloud Logging entries.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# E-ink display stack. `epd-waveshare`'s default features pull in
+# `linux-embedded-hal`, which doesn't cross-compile to xtensa-esp32-espidf
+# — disable defaults and re-enable only what we need. The `epd2in13_v3`
+# feature selects the SSD1680-based 2.13" V3/V4 panel (Inland 632694 is a
+# Waveshare V3 rebrand).
+embedded-graphics = "0.8.2"
+epd-waveshare = { version = "0.6.0", default-features = false, features = ["graphics", "epd2in13_v3"] }
+embedded-hal = "1.0"
+# `ExclusiveDevice` wraps an SPI bus + CS pin + Delay into the
+# `SpiDevice` trait that `epd-waveshare` 0.6 consumes.
+embedded-hal-bus = "0.2"
+# Larger / nicer font set than embedded-graphics' built-ins. The
+# `embedded_graphics_textstyle` feature lets fonts plug into e-g's
+# `Text` rendering path.
+u8g2-fonts = { version = "0.7.2", features = ["embedded_graphics_textstyle"] }
 
 [build-dependencies]
 embuild = "0.33"

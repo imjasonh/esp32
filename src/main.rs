@@ -12,6 +12,7 @@ use std::ffi::CStr;
 use std::time::Duration;
 
 mod cloud_log;
+mod display;
 mod gcp_auth;
 mod metrics;
 mod ota;
@@ -93,6 +94,15 @@ fn main() -> Result<()> {
         dns = ?ip_info.dns,
         "wifi connected",
     );
+
+    // Display: panel hardware isn't wired yet, so this runs in stub
+    // mode. The renderer + scene-diff path still execute end-to-end
+    // (see src/display.rs); swapping `Panel::stub()` for `Panel::new(...)`
+    // once SPI is wired requires no other changes.
+    let mut panel = display::Panel::stub();
+    if let Err(e) = panel.present(&display::boot_info_scene(FW_VERSION, &ip_info.ip.to_string())) {
+        tracing::warn!(error = %e, "display: present failed");
+    }
 
     // SNTP is only needed for cloud logging — the service-account JWT
     // auth requires real wall-clock time for `iat`/`exp` (Google rejects
