@@ -51,7 +51,8 @@ export PATH := $(PYTHON_SHIM):$(XTENSA_GCC_BIN):$(PATH)
 
 .PHONY: help build flash flash-all monitor run clean ensure-python-shim \
         save-image publish pull-verify check-gh-env \
-        provision provision-build bootstrap
+        provision provision-build bootstrap \
+        antithesis
 
 help:
 	@echo "Targets:"
@@ -67,6 +68,8 @@ help:
 	@echo ""
 	@echo "  make provision     Build NVS image from provisioning.toml + flash to device"
 	@echo "  make bootstrap     flash-all + provision (new device setup)"
+	@echo ""
+	@echo "  make antithesis    Run Antithesis property tests (host-side)"
 	@echo ""
 	@echo "Override the port: make flash PORT=/dev/cu.usbserial-XXXX"
 
@@ -204,6 +207,14 @@ pull-verify: $(FW_BIN) check-gh-env
 	    --tag latest \
 	    --bin $(CURDIR)/$(FW_BIN) \
 	    --auth
+
+# Property tests for the firmware's pure-Rust algorithms (DSSE PAE
+# encoding, OTA backoff/jitter math). Lives in tools/antithesis/ and
+# uses the Antithesis SDK so the same test binary runs locally, in CI,
+# and (eventually) inside the Antithesis simulator. A failed invariant
+# panics, so a non-zero exit fails the build.
+antithesis:
+	cd tools/antithesis && cargo run --release --target $(HOST_TRIPLE)
 
 check-gh-env:
 	@test -f gh.env || { \

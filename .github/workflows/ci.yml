@@ -92,3 +92,32 @@ jobs:
 
       - name: Build provision
         run: cd tools/provision && cargo build --release --target x86_64-unknown-linux-gnu
+
+  antithesis:
+    name: antithesis property tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/antithesis
+          shared-key: ci-antithesis
+
+      # Run the same `make antithesis` target devs run locally. The
+      # binary panics (exit 101) on any invariant violation, so a real
+      # bug fails the job. ANTITHESIS_SDK_LOCAL_OUTPUT also captures a
+      # JSON event log we upload as an artifact for post-mortem.
+      - name: Run Antithesis property tests
+        env:
+          ANTITHESIS_SDK_LOCAL_OUTPUT: ${{ github.workspace }}/antithesis.jsonl
+        run: make antithesis
+
+      - name: Upload Antithesis event log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: antithesis-event-log
+          path: antithesis.jsonl
+          if-no-files-found: ignore

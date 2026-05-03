@@ -25,8 +25,6 @@ const NVS_REPO: &str = "repo";
 const NVS_TAG: &str = "tag";
 const NVS_POLL_SECS: &str = "poll_secs";
 
-const BACKOFF_CAP: Duration = Duration::from_secs(3600); // 1h max between polls
-
 /// Where to fetch firmware from.
 pub struct OtaConfig {
     pub repo: String,           // "ghcr.io/imjasonh/esp32"
@@ -153,23 +151,18 @@ pub fn run(
 }
 
 /// Exponential backoff capped at BACKOFF_CAP, with ±10% jitter applied.
+/// Thin wrapper around `algos::backoff_with_jitter` that supplies the
+/// ESP32 hardware RNG; the math is unit-tested in `tools/antithesis/`.
 fn backoff_with_jitter(base: Duration, failures: u32) -> Duration {
-    // 2^10 = 1024x is plenty; the cap will be hit far earlier in practice.
-    let exp = failures.min(10);
-    let multiplied = base.saturating_mul(1u32 << exp);
-    let bounded = multiplied.min(BACKOFF_CAP);
-    jittered(bounded)
+    let r: u32 = unsafe { esp_idf_svc::sys::esp_random() };
+    crate::algos::backoff_with_jitter(base, failures, r)
 }
 
 /// Apply ±10% jitter using the ESP32's hardware RNG. Used on the success
 /// path too so a fleet doesn't poll in lockstep.
 fn jittered(base: Duration) -> Duration {
     let r: u32 = unsafe { esp_idf_svc::sys::esp_random() };
-    let pct = (r % 21) as i32 - 10; // -10..=+10
-    let secs = base.as_secs() as i64;
-    let delta = (secs * pct as i64) / 100;
-    let new_secs = (secs + delta).max(1) as u64;
-    Duration::from_secs(new_secs)
+    crate::algos::apply_jitter(base, r)
 }
 
 enum PollOutcome {

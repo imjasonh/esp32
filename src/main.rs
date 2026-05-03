@@ -11,6 +11,7 @@ use esp_idf_svc::wifi::{
 use std::ffi::CStr;
 use std::time::Duration;
 
+mod algos;
 mod cloud_log;
 mod gcp_auth;
 mod metrics;

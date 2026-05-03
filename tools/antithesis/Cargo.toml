@@ -1,0 +1,18 @@
+[package]
+name = "antithesis-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "antithesis-tests"
+path = "src/main.rs"
+
+[dependencies]
+# Antithesis property-based / simulation-testing SDK. With default
+# features it's a no-op locally unless `ANTITHESIS_SDK_LOCAL_OUTPUT`
+# is set; the test harness here also wraps each invariant in a plain
+# `panic!` so violations exit non-zero in `cargo run` / CI even
+# without that env var.
+antithesis_sdk = "0.2"
+serde_json = "1"

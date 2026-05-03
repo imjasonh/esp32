@@ -104,7 +104,7 @@ pub fn verify_bundle(
     let payload_bytes = b64_std()
         .decode(&bundle.dsse_envelope.payload)
         .context("base64-decode DSSE payload")?;
-    let pae = pae_dsse_v1(&bundle.dsse_envelope.payload_type, &payload_bytes);
+    let pae = crate::algos::pae_dsse_v1(&bundle.dsse_envelope.payload_type, &payload_bytes);
 
     verify_p256_ecdsa(&leaf, &pae, &sig_bytes).context("DSSE signature verify")?;
     tracing::info!("ota: DSSE signature verified");
@@ -137,21 +137,6 @@ pub fn verify_bundle(
 
 fn b64_std() -> base64::engine::GeneralPurpose {
     base64::engine::general_purpose::STANDARD
-}
-
-/// DSSE Pre-Authentication Encoding (https://github.com/secure-systems-lab/dsse).
-/// PAE("DSSEv1", payloadType, payload) = "DSSEv1 <len(t)> <t> <len(p)> <p>"
-fn pae_dsse_v1(payload_type: &str, payload: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(64 + payload_type.len() + payload.len());
-    out.extend_from_slice(b"DSSEv1 ");
-    out.extend_from_slice(payload_type.len().to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload_type.as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload.len().to_string().as_bytes());
-    out.push(b' ');
-    out.extend_from_slice(payload);
-    out
 }
 
 /// Extract the signer identity from a Fulcio cert's SAN extension.

@@ -6,6 +6,7 @@ provisioning.toml
 sdkconfig.defaults
 tools/publisher/target
 tools/provision/target
+tools/antithesis/target
 # GCP service-account key + the PEM extracted from it. Referenced by
 # provisioning.toml; never check in.
 gcp-sa-key.json
