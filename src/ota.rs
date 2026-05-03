@@ -90,6 +90,7 @@ pub fn run(
     nvs_partition: EspDefaultNvsPartition,
     fw_version: &str,
     trust: crate::trust::TrustConfig,
+    short_https: Option<crate::gcp_auth::ShortHttpsLock>,
 ) -> ! {
     crate::metrics::publish_self(&crate::metrics::handles::OTA);
     let mut nvs = match EspNvs::new(nvs_partition, NVS_NAMESPACE, true) {
@@ -127,7 +128,7 @@ pub fn run(
             "ota: sleeping",
         );
         std::thread::sleep(sleep_for);
-        match poll_once(&mut nvs, &cfg, &trust) {
+        match poll_once(&mut nvs, &cfg, &trust, short_https.as_ref()) {
             Ok(PollOutcome::NoChange) => {
                 consecutive_failures = 0;
                 tracing::debug!("ota: no change");
@@ -180,12 +181,20 @@ fn poll_once(
     nvs: &mut EspNvs<NvsDefault>,
     cfg: &OtaConfig,
     trust: &crate::trust::TrustConfig,
+    short_https: Option<&crate::gcp_auth::ShortHttpsLock>,
 ) -> Result<PollOutcome> {
-    let token = fetch_anon_token(&cfg.repo)?;
+    // Phase 1 — token + manifest. Two short HTTPS calls; serialise
+    // against cloud_log + metrics POSTs so we don't pile concurrent
+    // TLS handshakes on the heap. Held only for these two fetches; the
+    // ~ms gap between releasing here and re-acquiring before the sig
+    // bundle fetch is enough for the senders to slip through.
+    let (token, manifest, manifest_digest_hex) = {
+        let _l = short_https.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        let token = fetch_anon_token(&cfg.repo)?;
+        let (manifest, mdig) = fetch_manifest(&cfg.repo, &cfg.tag, &token)?;
+        (token, manifest, mdig)
+    };
 
-    // Fetch manifest and compute its SHA256 — that's the manifest digest
-    // cosign signed (and that we'll need for the bundle lookup).
-    let (manifest, manifest_digest_hex) = fetch_manifest(&cfg.repo, &cfg.tag, &token)?;
     let layer = manifest
         .layers
         .into_iter()
@@ -211,14 +220,25 @@ fn poll_once(
         "ota: new digest, verifying signature before download",
     );
 
-    // Phase 4a: fetch and verify the cosign signature bundle BEFORE the
-    // (much larger) firmware download. Refuses unknown signers.
-    let bundle = fetch_signature_bundle(&cfg.repo, &manifest_digest_hex, &token)
-        .context("fetch signature bundle")?;
+    // Phase 2 — sig bundle fetch (3 sub-fetches), then local verify.
+    // Re-acquire the lock for the network calls; release before the
+    // CPU-bound `verify_bundle` so cloud_log/metrics aren't blocked
+    // behind our X.509 + ECDSA work.
+    let bundle = {
+        let _l = short_https.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
+        fetch_signature_bundle(&cfg.repo, &manifest_digest_hex, &token)
+            .context("fetch signature bundle")?
+    };
     crate::sig::verify_bundle(&bundle, &manifest_digest_hex, trust)
         .context("verify signature bundle")?;
     tracing::info!("ota: signature verified, proceeding with download");
 
+    // Phase 3 — long blob download. Deliberately UNLOCKED: a multi-
+    // second download must not block per-5-s cloud_log flushes or
+    // per-30-s metrics POSTs. Holds its own TLS session for the
+    // duration; cloud_log + metrics may run a second concurrent
+    // session, which the heap can absorb (vs the previous worst case
+    // of three).
     download_and_apply(&cfg.repo, &layer, &token)?;
 
     // Persist as pending; main.rs will promote to last_digest after the

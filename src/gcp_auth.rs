@@ -22,10 +22,31 @@ use rsa::pkcs8::DecodePrivateKey;
 use rsa::signature::{SignatureEncoding, Signer};
 use rsa::RsaPrivateKey;
 use serde::{Deserialize, Serialize};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::cloud_log::GcpConfig;
+
+/// Serialises short HTTPS calls — cloud_log POSTs, metrics POSTs, OTA
+/// manifest + sig-bundle fetches, and the OAuth2 token mint that any
+/// of them may trigger. Each TLS handshake allocates ~25-35 KB of
+/// mbedtls context (less with `CONFIG_MBEDTLS_DYNAMIC_BUFFER`); three
+/// concurrent handshakes blew our heap budget (`min_free_heap` ~9 KB
+/// before this lock).
+///
+/// Held **at call sites** in the senders, not inside `http_post`
+/// itself — std `Mutex` isn't reentrant, so locking inside `http_post`
+/// would deadlock when `get_or_refresh()` mints a token while the
+/// caller already holds the lock.
+///
+/// `ota::download_and_apply` deliberately does **not** take this lock:
+/// the multi-second blob download must not block per-5-s cloud_log
+/// flushes or per-30-s metrics POSTs.
+pub type ShortHttpsLock = Arc<Mutex<()>>;
+
+pub fn new_short_https_lock() -> ShortHttpsLock {
+    Arc::new(Mutex::new(()))
+}
 
 /// A bearer token cached until ~5 min before expiry.
 struct CachedToken {

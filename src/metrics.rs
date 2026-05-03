@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cloud_log::{GcpConfig, LogQueue};
-use crate::gcp_auth::{device_mac, http_post, unix_to_rfc3339, TokenProvider};
+use crate::gcp_auth::{device_mac, http_post, unix_to_rfc3339, ShortHttpsLock, TokenProvider};
 
 const METRIC_PREFIX: &str = "custom.googleapis.com/esp32";
 
@@ -48,7 +48,12 @@ fn read_handle(slot: &AtomicUsize) -> Option<esp_idf_svc::sys::TaskHandle_t> {
     }
 }
 
-pub fn run(cfg: GcpConfig, auth: Arc<TokenProvider>, queue: LogQueue) -> ! {
+pub fn run(
+    cfg: GcpConfig,
+    auth: Arc<TokenProvider>,
+    queue: LogQueue,
+    short_https: ShortHttpsLock,
+) -> ! {
     publish_self(&handles::METRICS);
 
     tracing::info!(
@@ -76,6 +81,11 @@ pub fn run(cfg: GcpConfig, auth: Arc<TokenProvider>, queue: LogQueue) -> ! {
         std::thread::sleep(sleep_for);
 
         let snapshot = collect(&queue);
+
+        // Lock spans token refresh + POST so both TLS handshakes
+        // serialise against cloud_log and OTA short fetches. See the
+        // matching comment in cloud_log.rs.
+        let _lock = short_https.lock().unwrap_or_else(|e| e.into_inner());
         let bearer = match auth.get_or_refresh() {
             Ok(b) => b,
             Err(e) => {

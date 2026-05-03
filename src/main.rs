@@ -138,14 +138,23 @@ fn main() -> Result<()> {
         }
     }
 
+    // One shared lock that serialises the *short* HTTPS calls across
+    // cloud_log + metrics + OTA's manifest/sig-bundle fetches. The OTA
+    // download (multi-second blob) deliberately runs without it. Even
+    // when the [gcp] block is absent we still construct it so OTA's
+    // signature can be the same; cloud_log/metrics just won't be there
+    // to contend for it.
+    let short_https = gcp_auth::new_short_https_lock();
+
     let ota_nvs = nvs.clone();
     let ota_trust = trust.clone();
+    let ota_lock = short_https.clone();
     std::thread::Builder::new()
         // HTTPS + JSON + SHA256 is ~32 KB; phase 4a adds X.509 parsing
         // and ECDSA P-256/P-384 verification on top, which want more.
         // 48 KB is observed-safe with headroom.
         .stack_size(48 * 1024)
-        .spawn(move || ota::run(ota_nvs, FW_VERSION, ota_trust))
+        .spawn(move || ota::run(ota_nvs, FW_VERSION, ota_trust, Some(ota_lock)))
         .expect("spawn ota thread");
 
     if let (Some(cfg), Some(queue)) = (gcp, log_queue) {
@@ -169,21 +178,23 @@ fn main() -> Result<()> {
             let cl_cfg = cfg.clone();
             let cl_auth = auth.clone();
             let cl_queue = queue.clone();
+            let cl_lock = short_https.clone();
             std::thread::Builder::new()
                 // RSA signing + HTTPS POST. 32 KB matches the OTA loop budget.
                 .stack_size(32 * 1024)
-                .spawn(move || cloud_log::run(cl_cfg, cl_auth, cl_queue))
+                .spawn(move || cloud_log::run(cl_cfg, cl_auth, cl_queue, cl_lock))
                 .expect("spawn cloud_log thread");
 
             if cfg.metrics_interval_secs > 0 {
                 let m_cfg = cfg;
                 let m_auth = auth;
                 let m_queue = queue;
+                let m_lock = short_https;
                 std::thread::Builder::new()
                     // No crypto on hot path (token cached via auth).
                     // Mainly HTTPS POST + serde_json. 16 KB sufficient.
                     .stack_size(16 * 1024)
-                    .spawn(move || metrics::run(m_cfg, m_auth, m_queue))
+                    .spawn(move || metrics::run(m_cfg, m_auth, m_queue, m_lock))
                     .expect("spawn metrics thread");
             }
         }
