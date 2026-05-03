@@ -7,15 +7,30 @@ CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=16384
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 
-# Allow mbedtls to grow its TLS I/O buffers dynamically per-session and
-# free them between handshakes, instead of pinning the default 16+16 KB
-# in/out buffers per concurrent session. Recovers ~15-25 KB per active
-# session — needed because we run three concurrent TLS clients
-# (cloud_log, metrics, OTA) and three full-size buffer pairs blow past
-# our heap budget (`min_free_heap` watermark hit ~9 KB).
+# mbedtls heap budgeting. We routinely have 2-3 concurrent TLS sessions
+# (cloud_log → logging.googleapis.com, metrics → monitoring.googleapis.com,
+# OTA → ghcr.io / pkg-containers); without these knobs the per-session
+# heap pinned for I/O buffers + cert chain blows our budget and the
+# next handshake fails with MBEDTLS_ERR_SSL_ALLOC_FAILED (-0x7F00).
+#
+# Even with serialization (cloud_log + metrics + OTA short fetches share
+# a Mutex; OTA blob download deliberately doesn't), the OTA download
+# holds its session open for tens of seconds while metrics/cloud_log
+# handshakes need to fit alongside it.
+#
+# - DYNAMIC_BUFFER: I/O buffers grow per-session up to the configured
+#   max instead of being pinned at 16+16 KB.
+# - DYNAMIC_FREE_CONFIG_DATA: free the mbedtls_ssl_config struct after
+#   handshake.
+# - DYNAMIC_FREE_CA_CERT: drop the CA bundle data after handshake (we
+#   re-attach it from esp_crt_bundle on the next handshake).
+# - SSL_KEEP_PEER_CERTIFICATE=n: drop the parsed peer cert chain after
+#   handshake. We don't reuse sessions or do mutual TLS, so we never
+#   need it post-handshake. Saves ~3-5 KB per active session.
 CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CONFIG_DATA=y
 CONFIG_MBEDTLS_DYNAMIC_FREE_CA_CERT=y
+CONFIG_MBEDTLS_SSL_KEEP_PEER_CERTIFICATE=n
 
 # OTA: custom partition table with two app slots, plus app-rollback support
 # so a bad OTA can be reverted by the bootloader on next boot.

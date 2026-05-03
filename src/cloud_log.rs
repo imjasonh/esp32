@@ -21,7 +21,10 @@ use tracing::{Event, Level, Subscriber};
 use tracing_subscriber::layer::Context as LayerContext;
 use tracing_subscriber::Layer;
 
-use crate::gcp_auth::{device_mac, http_post, now_unix_secs, unix_to_rfc3339, TokenProvider};
+use crate::gcp_auth::{
+    device_mac, http_post, now_unix_secs, ota_download_in_progress, unix_to_rfc3339,
+    ShortHttpsLock, TokenProvider,
+};
 
 const NVS_GCP_NS: &str = "gcp";
 const NVS_PROJECT_ID: &str = "project_id";
@@ -317,7 +320,12 @@ impl FieldCapture {
 /// Sender thread main loop. Drains the queue every `FLUSH_INTERVAL`,
 /// pulls the bearer from the shared `TokenProvider`, and POSTs batches
 /// to Cloud Logging.
-pub fn run(cfg: GcpConfig, auth: Arc<TokenProvider>, queue: LogQueue) -> ! {
+pub fn run(
+    cfg: GcpConfig,
+    auth: Arc<TokenProvider>,
+    queue: LogQueue,
+    short_https: ShortHttpsLock,
+) -> ! {
     crate::metrics::publish_self(&crate::metrics::handles::CLOUD_LOG);
     tracing::info!(
         project = %cfg.project_id,
@@ -341,12 +349,28 @@ pub fn run(cfg: GcpConfig, auth: Arc<TokenProvider>, queue: LogQueue) -> ! {
         };
         std::thread::sleep(sleep_for);
 
+        // Skip — but don't drain — when an OTA download is streaming.
+        // Our handshake's ~25-30 KB doesn't fit alongside the held-open
+        // download TLS session on this chip's heap. Entries accumulate
+        // in the bounded queue and flush in a single batched POST once
+        // the download completes (or fails). See OTA_DOWNLOAD_IN_PROGRESS.
+        if ota_download_in_progress() {
+            tracing::debug!("cloud_log: ota download in progress, skipping flush");
+            continue;
+        }
+
         let batch = queue.drain(BATCH_MAX_ENTRIES);
         if batch.is_empty() {
             consecutive_failures = 0;
             continue;
         }
 
+        // Hold the short-https lock from token-refresh through POST.
+        // `auth.get_or_refresh()` may transparently mint a new token,
+        // which is itself an HTTPS POST to oauth2.googleapis.com — both
+        // the mint and the entries:write call need to be inside the
+        // lock to actually serialise vs metrics + OTA short fetches.
+        let _lock = short_https.lock().unwrap_or_else(|e| e.into_inner());
         let bearer = match auth.get_or_refresh() {
             Ok(b) => b,
             Err(e) => {
