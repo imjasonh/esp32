@@ -1,9 +1,10 @@
 # E-ink display — plan
 
 The Inland ESP-WROOM-32 dev board doesn't have a software-controllable LED
-(see `notes.txt`), so the visible-output story for this project is an e-ink
-display. This file captures the hardware choice, the Rust graphics stack
-we'll use, and a shortlist of projects to build on top.
+(see [`setup.md`](setup.md)), so the visible-output story for this
+project is an e-ink display. This file captures the hardware choice,
+the Rust graphics stack we'll use, and a shortlist of projects to
+build on top.
 
 ## Hardware
 
