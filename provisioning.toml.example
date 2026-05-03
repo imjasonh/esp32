@@ -40,3 +40,12 @@ issuer = "https://token.actions.githubusercontent.com"
 # sa_key_pem = "gcp-sa-key.pem"     # path to the PKCS#8 RSA private key PEM
 # min_severity = "info"             # trace / debug / info / warn / error
 # metrics_interval_secs = 300       # 0 = metrics off (logs still ship); default 300
+
+# Optional. If absent, OTA loop uses compile-time defaults
+# (ghcr.io/imjasonh/esp32:latest, 60 s poll). Each field is
+# individually optional too — only present ones override.
+#
+# [ota]
+# repo = "ghcr.io/imjasonh/esp32"   # default
+# tag = "latest"                    # default
+# poll_secs = 600                   # default 60; bump for steady-state fleets

@@ -182,7 +182,7 @@ fn main() -> Result<()> {
             std::thread::Builder::new()
                 // RSA signing + HTTPS POST. 32 KB matches the OTA loop budget.
                 .stack_size(32 * 1024)
-                .spawn(move || cloud_log::run(cl_cfg, cl_auth, cl_queue, cl_lock))
+                .spawn(move || cloud_log::run(cl_cfg, FW_VERSION, cl_auth, cl_queue, cl_lock))
                 .expect("spawn cloud_log thread");
 
             if cfg.metrics_interval_secs > 0 {
@@ -194,7 +194,7 @@ fn main() -> Result<()> {
                     // No crypto on hot path (token cached via auth).
                     // Mainly HTTPS POST + serde_json. 16 KB sufficient.
                     .stack_size(16 * 1024)
-                    .spawn(move || metrics::run(m_cfg, m_auth, m_queue, m_lock))
+                    .spawn(move || metrics::run(m_cfg, FW_VERSION, m_auth, m_queue, m_lock))
                     .expect("spawn metrics thread");
             }
         }

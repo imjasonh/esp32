@@ -53,6 +53,7 @@ fn read_handle(slot: &AtomicUsize) -> Option<esp_idf_svc::sys::TaskHandle_t> {
 
 pub fn run(
     cfg: GcpConfig,
+    fw_version: &'static str,
     auth: Arc<TokenProvider>,
     queue: LogQueue,
     short_https: ShortHttpsLock,
@@ -111,7 +112,7 @@ pub fn run(
             }
         };
 
-        match post_time_series(&url, &cfg.project_id, &mac, &bearer, &snapshot) {
+        match post_time_series(&url, &cfg.project_id, &mac, fw_version, &bearer, &snapshot) {
             Ok(()) => {
                 tracing::debug!(
                     series = snapshot.series_count(),
@@ -302,6 +303,7 @@ fn post_time_series(
     url: &str,
     project_id: &str,
     mac: &str,
+    fw_version: &str,
     bearer: &str,
     snapshot: &Snapshot,
 ) -> Result<()> {
@@ -323,7 +325,18 @@ fn post_time_series(
     };
 
     let mut series = Vec::with_capacity(snapshot.series_count());
-    let mut push = |name: &str, labels: serde_json::Map<String, serde_json::Value>, value: i64| {
+    // `fw_version` rides on every metric as a label so Cloud Monitoring
+    // can split / group by release. Resource labels can't carry it
+    // because `generic_node` has a fixed schema; metric labels are
+    // per-series and let queries split heap, rssi, etc. by fw.
+    let mut push = |name: &str,
+                    extra_labels: serde_json::Map<String, serde_json::Value>,
+                    value: i64| {
+        let mut labels = extra_labels;
+        labels.insert(
+            "fw_version".into(),
+            serde_json::Value::String(fw_version.to_string()),
+        );
         series.push(TimeSeries {
             metric: Metric {
                 type_: format!("{}/{}", METRIC_PREFIX, name),
