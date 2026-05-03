@@ -233,13 +233,19 @@ fn poll_once(
         .context("verify signature bundle")?;
     tracing::info!("ota: signature verified, proceeding with download");
 
-    // Phase 3 — long blob download. Deliberately UNLOCKED: a multi-
-    // second download must not block per-5-s cloud_log flushes or
-    // per-30-s metrics POSTs. Holds its own TLS session for the
-    // duration; cloud_log + metrics may run a second concurrent
-    // session, which the heap can absorb (vs the previous worst case
-    // of three).
-    download_and_apply(&cfg.repo, &layer, &token)?;
+    // Phase 3 — long blob download. Deliberately UNLOCKED so a
+    // multi-second download doesn't block per-5-s cloud_log flushes
+    // or per-30-s metrics POSTs. Instead we set
+    // OTA_DOWNLOAD_IN_PROGRESS for the duration so cloud_log + metrics
+    // skip their POST cycle and let the queue accumulate; their
+    // handshake otherwise needs ~25-30 KB of contiguous heap
+    // alongside the held-open download session, and the second
+    // concurrent TLS reliably OOMs on this chip. The guard clears the
+    // flag on Drop, so a download error via `?` still releases it.
+    {
+        let _g = crate::gcp_auth::OtaDownloadGuard::enter();
+        download_and_apply(&cfg.repo, &layer, &token)?;
+    }
 
     // Persist as pending; main.rs will promote to last_digest after the
     // post-reboot pending-verify check passes.

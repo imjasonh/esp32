@@ -22,7 +22,8 @@ use tracing_subscriber::layer::Context as LayerContext;
 use tracing_subscriber::Layer;
 
 use crate::gcp_auth::{
-    device_mac, http_post, now_unix_secs, unix_to_rfc3339, ShortHttpsLock, TokenProvider,
+    device_mac, http_post, now_unix_secs, ota_download_in_progress, unix_to_rfc3339,
+    ShortHttpsLock, TokenProvider,
 };
 
 const NVS_GCP_NS: &str = "gcp";
@@ -347,6 +348,16 @@ pub fn run(
             FLUSH_INTERVAL
         };
         std::thread::sleep(sleep_for);
+
+        // Skip — but don't drain — when an OTA download is streaming.
+        // Our handshake's ~25-30 KB doesn't fit alongside the held-open
+        // download TLS session on this chip's heap. Entries accumulate
+        // in the bounded queue and flush in a single batched POST once
+        // the download completes (or fails). See OTA_DOWNLOAD_IN_PROGRESS.
+        if ota_download_in_progress() {
+            tracing::debug!("cloud_log: ota download in progress, skipping flush");
+            continue;
+        }
 
         let batch = queue.drain(BATCH_MAX_ENTRIES);
         if batch.is_empty() {
