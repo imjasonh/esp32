@@ -57,6 +57,10 @@ struct ProvisioningConfig {
     trust: TrustConfig,
     /// Optional. If absent, the device boots with serial-only logging.
     gcp: Option<GcpConfig>,
+    /// Optional. If absent, OTA loop uses its compile-time defaults
+    /// (`ghcr.io/imjasonh/esp32:latest`, 60 s poll). All fields are
+    /// individually optional too; only present ones override defaults.
+    ota: Option<OtaProvisioningConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -103,6 +107,17 @@ fn default_severity() -> String {
 
 fn default_metrics_interval() -> u32 {
     300
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct OtaProvisioningConfig {
+    /// Override `ghcr.io/<owner>/<name>` repo. Default
+    /// `ghcr.io/imjasonh/esp32`.
+    repo: Option<String>,
+    /// Override the image tag. Default `latest`.
+    tag: Option<String>,
+    /// Override the OTA poll interval in seconds. Default 60.
+    poll_secs: Option<u32>,
 }
 
 fn severity_to_u8(s: &str) -> Result<u8> {
@@ -317,6 +332,23 @@ fn write_csv(
             "u32",
             &gcp.metrics_interval_secs.to_string(),
         ])?;
+    }
+
+    // ota namespace (optional). Each field is independently optional;
+    // missing keys leave the firmware on its compile-time defaults
+    // (`ghcr.io/imjasonh/esp32:latest`, 60 s poll). Key names match
+    // src/ota.rs's NVS_REPO / NVS_TAG / NVS_POLL_SECS constants.
+    if let Some(ota) = &cfg.ota {
+        wtr.write_record(&["ota", "namespace", "", ""])?;
+        if let Some(repo) = &ota.repo {
+            wtr.write_record(&["repo", "data", "string", repo])?;
+        }
+        if let Some(tag) = &ota.tag {
+            wtr.write_record(&["tag", "data", "string", tag])?;
+        }
+        if let Some(poll_secs) = ota.poll_secs {
+            wtr.write_record(&["poll_secs", "data", "u32", &poll_secs.to_string()])?;
+        }
     }
 
     wtr.flush()?;

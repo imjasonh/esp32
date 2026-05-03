@@ -322,6 +322,7 @@ impl FieldCapture {
 /// to Cloud Logging.
 pub fn run(
     cfg: GcpConfig,
+    fw_version: &'static str,
     auth: Arc<TokenProvider>,
     queue: LogQueue,
     short_https: ShortHttpsLock,
@@ -384,7 +385,7 @@ pub fn run(
             }
         };
 
-        match post_batch(&log_name, &cfg.project_id, &mac, &bearer, &batch) {
+        match post_batch(&log_name, &cfg.project_id, &mac, fw_version, &bearer, &batch) {
             Ok(()) => {
                 tracing::debug!(
                     entries = batch.len(),
@@ -445,6 +446,7 @@ fn post_batch(
     log_name: &str,
     project_id: &str,
     mac: &str,
+    fw_version: &str,
     bearer: &str,
     batch: &[LogEntry],
 ) -> Result<()> {
@@ -452,7 +454,7 @@ fn post_batch(
         .iter()
         .map(|e| Entry {
             severity: severity_str(e.severity),
-            json_payload: build_payload(e),
+            json_payload: build_payload(e, fw_version),
             timestamp: e.timestamp_unix_secs.and_then(unix_to_rfc3339),
         })
         .collect();
@@ -493,7 +495,7 @@ fn severity_str(level: Level) -> &'static str {
     }
 }
 
-fn build_payload(e: &LogEntry) -> serde_json::Value {
+fn build_payload(e: &LogEntry, fw_version: &str) -> serde_json::Value {
     let mut map = e.fields.clone();
     map.insert(
         "message".to_string(),
@@ -502,6 +504,13 @@ fn build_payload(e: &LogEntry) -> serde_json::Value {
     map.insert(
         "module".to_string(),
         serde_json::Value::String(e.target.clone()),
+    );
+    // Tag every entry with the firmware git SHA so behaviour can be
+    // bucketed by release in Cloud Logging
+    // (`jsonPayload.fw_version="..."`). Adds ~15 bytes/entry.
+    map.insert(
+        "fw_version".to_string(),
+        serde_json::Value::String(fw_version.to_string()),
     );
     if e.dropped_before > 0 {
         map.insert(
