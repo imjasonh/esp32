@@ -9,6 +9,70 @@ use std::time::Duration;
 /// Maximum sleep between OTA polls when backing off after failures.
 pub const BACKOFF_CAP: Duration = Duration::from_secs(3600);
 
+/// OCI mediaType for the firmware blob layer in our artifacts.
+/// `tools/publisher` writes this and `src/ota.rs` checks for it.
+pub const FIRMWARE_LAYER_MEDIA_TYPE: &str = "application/vnd.esp32.firmware.bin";
+
+/// Sigstore bundle layers carry a versioned mediaType
+/// (`...bundle.v0.3+json`, etc.); we accept any version so we don't have
+/// to chase cosign upgrades.
+pub const SIGSTORE_BUNDLE_MEDIA_TYPE_PREFIX: &str = "application/vnd.dev.sigstore.bundle.";
+
+/// Length of a SHA-256 digest rendered in lowercase hex (no `sha256:` prefix).
+pub const SHA256_HEX_LEN: usize = 64;
+
+// --- OCI / digest helpers ---------------------------------------------------
+
+/// Returns true if `s` is the canonical OCI digest form
+/// `"sha256:" + 64 lowercase hex chars`. Strict — uppercase hex,
+/// trailing whitespace, or wrong length all return false.
+pub fn is_valid_sha256_digest(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix("sha256:") else {
+        return false;
+    };
+    is_lowercase_sha256_hex(hex)
+}
+
+/// Same as `is_valid_sha256_digest` but for a bare hex string with no
+/// `sha256:` prefix (e.g. the manifest digest used to build the cosign
+/// bundle tag).
+pub fn is_lowercase_sha256_hex(hex: &str) -> bool {
+    hex.len() == SHA256_HEX_LEN
+        && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Strip the `"sha256:"` prefix from an OCI digest. Returns `None` if
+/// the prefix is missing. Lenient — does not validate that the
+/// remainder is hex; pair with `is_lowercase_sha256_hex` if you need
+/// that. (Kept lenient because the OTA download path already
+/// fingerprints the blob bytes against this string and would catch
+/// malformed hex via the SHA mismatch bail.)
+pub fn strip_sha256_prefix(digest: &str) -> Option<&str> {
+    digest.strip_prefix("sha256:")
+}
+
+/// Cosign publishes the Sigstore bundle for a given OCI artifact at a
+/// tag derived from the artifact's manifest digest:
+/// `sha256-<64 hex chars>`. Used by the OTA verifier to locate the
+/// bundle without a referrers API call.
+pub fn cosign_bundle_tag(manifest_digest_hex: &str) -> String {
+    format!("sha256-{}", manifest_digest_hex)
+}
+
+/// Return the `<owner>/<name>` portion of a `ghcr.io/<owner>/<name>`
+/// repo string. `None` if the input doesn't start with `ghcr.io/`.
+/// Other registries aren't supported yet; once they are this can grow.
+pub fn ghcr_repo_path(repo: &str) -> Option<&str> {
+    repo.strip_prefix("ghcr.io/")
+}
+
+/// Extract a digest like `sha256:abc...` from an OCI manifest URL of
+/// the shape `https://<host>/v2/<path>/manifests/<digest>`. `None` if
+/// the URL doesn't contain `/manifests/`.
+pub fn digest_from_manifest_url(url: &str) -> Option<&str> {
+    url.rsplit_once("/manifests/").map(|(_, d)| d)
+}
+
 /// DSSE Pre-Authentication Encoding (https://github.com/secure-systems-lab/dsse).
 /// PAE("DSSEv1", payloadType, payload) = "DSSEv1 <len(t)> <t> <len(p)> <p>"
 pub fn pae_dsse_v1(payload_type: &str, payload: &[u8]) -> Vec<u8> {

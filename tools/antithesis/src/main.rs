@@ -19,6 +19,10 @@ use antithesis_sdk::{antithesis_init, assert_always, assert_sometimes, random};
 use serde_json::json;
 use std::time::Duration;
 
+// `dead_code` here covers consts the test crate doesn't reference but
+// the firmware does (e.g. mediaType strings). Their values are still
+// reachable via the `algos::` path for any test that wants them.
+#[allow(dead_code)]
 #[path = "../../../src/algos.rs"]
 mod algos;
 
@@ -51,6 +55,11 @@ fn main() {
     test_pae_dsse_v1();
     test_apply_jitter();
     test_backoff_with_jitter();
+    test_is_valid_sha256_digest();
+    test_strip_sha256_prefix();
+    test_cosign_bundle_tag();
+    test_ghcr_repo_path();
+    test_digest_from_manifest_url();
 
     eprintln!("antithesis-tests: all properties held");
 }
@@ -315,5 +324,278 @@ fn test_backoff_with_jitter() {
         let near_cap = result >= 3600 - 360;
         let d = json!({"rand": rand, "got": result});
         assert_sometimes!(near_cap, "backoff_with_jitter: cap is reached on high failure counts", &d);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// is_valid_sha256_digest
+// ---------------------------------------------------------------------------
+
+fn test_is_valid_sha256_digest() {
+    eprintln!("antithesis-tests: is_valid_sha256_digest");
+
+    // Hand-rolled vectors covering the canonical-good case and the
+    // failure modes the firmware actually has to defend against.
+    let cases: &[(&str, bool)] = &[
+        // 64-char lowercase hex with prefix: the canonical accepted form.
+        (
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            true,
+        ),
+        ("", false),
+        ("sha256:", false),
+        // 63 chars
+        (
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde",
+            false,
+        ),
+        // 65 chars
+        (
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0",
+            false,
+        ),
+        // Uppercase hex — registries use lowercase canonically; mixing case
+        // would mismatch on string comparison against `last_digest` in NVS.
+        (
+            "sha256:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            false,
+        ),
+        // Non-hex char (`g`)
+        (
+            "sha256:0123456789abcdeg0123456789abcdef0123456789abcdef0123456789abcdef",
+            false,
+        ),
+        // Wrong algo prefix
+        (
+            "sha512:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            false,
+        ),
+        // Missing prefix entirely
+        (
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            false,
+        ),
+    ];
+    for (input, expected) in cases {
+        let got = algos::is_valid_sha256_digest(input);
+        check!(
+            got == *expected,
+            "is_valid_sha256_digest: vector matches expected",
+            json!({"input": input, "expected": expected, "got": got}),
+        );
+    }
+
+    // Property: a randomly built well-formed digest is always accepted.
+    for _ in 0..ITERS {
+        let mut hex = String::with_capacity(64);
+        for _ in 0..64 {
+            let nibble = random::get_random() % 16;
+            hex.push(char::from_digit(nibble as u32, 16).unwrap());
+        }
+        let digest = format!("sha256:{}", hex);
+        check!(
+            algos::is_valid_sha256_digest(&digest),
+            "is_valid_sha256_digest: random valid digest accepted",
+            json!({"digest": digest}),
+        );
+    }
+
+    // Property: flipping any single hex char to a non-hex byte rejects.
+    for _ in 0..ITERS {
+        let mut bytes: Vec<u8> = (0..64).map(|_| b"0123456789abcdef"[(random::get_random() as usize) & 0xf]).collect();
+        let pos = (random::get_random() as usize) % bytes.len();
+        // Pick a non-hex ASCII char.
+        let bad = *random::random_choice(&[b'g' as u8, b'G', b'!', b':', b' ', b'-', b'X', b'.']).unwrap();
+        bytes[pos] = bad;
+        let hex = String::from_utf8(bytes).unwrap();
+        let digest = format!("sha256:{}", hex);
+        check!(
+            !algos::is_valid_sha256_digest(&digest),
+            "is_valid_sha256_digest: any non-hex char rejects",
+            json!({"digest": digest, "bad_at": pos}),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// strip_sha256_prefix
+// ---------------------------------------------------------------------------
+
+fn test_strip_sha256_prefix() {
+    eprintln!("antithesis-tests: strip_sha256_prefix");
+
+    for _ in 0..ITERS {
+        // Random hex content of varying length — strip is intentionally
+        // lenient about the body, only the prefix is required.
+        let len = (random::get_random() % 80) as usize;
+        let body: String = (0..len)
+            .map(|_| b"0123456789abcdef"[(random::get_random() as usize) & 0xf] as char)
+            .collect();
+        let with = format!("sha256:{}", body);
+
+        let stripped = algos::strip_sha256_prefix(&with);
+        check!(
+            stripped == Some(body.as_str()),
+            "strip_sha256_prefix: round-trips for sha256:<body>",
+            json!({"input": with, "got": stripped}),
+        );
+
+        // Without the prefix → None.
+        let stripped2 = algos::strip_sha256_prefix(&body);
+        check!(
+            stripped2.is_none() || body.starts_with("sha256:"),
+            "strip_sha256_prefix: None when prefix is absent",
+            json!({"input": body, "got": stripped2}),
+        );
+
+        // sha512:... or any other algo prefix is rejected (None).
+        let other = format!("sha512:{}", body);
+        check!(
+            algos::strip_sha256_prefix(&other).is_none(),
+            "strip_sha256_prefix: rejects non-sha256 algo prefix",
+            json!({"input": other}),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// cosign_bundle_tag
+// ---------------------------------------------------------------------------
+
+fn test_cosign_bundle_tag() {
+    eprintln!("antithesis-tests: cosign_bundle_tag");
+
+    for _ in 0..ITERS {
+        let mut hex = String::with_capacity(64);
+        for _ in 0..64 {
+            let nibble = random::get_random() % 16;
+            hex.push(char::from_digit(nibble as u32, 16).unwrap());
+        }
+        let tag = algos::cosign_bundle_tag(&hex);
+
+        // Required prefix: cosign and registries agree on this exact
+        // mapping. A typo here would route the OTA verifier to a
+        // non-existent tag and silently bork all signature lookups.
+        check!(
+            tag.starts_with("sha256-"),
+            "cosign_bundle_tag: starts with sha256-",
+            json!({"hex": hex, "tag": tag}),
+        );
+        check!(
+            tag.ends_with(&hex),
+            "cosign_bundle_tag: ends with the hex digest",
+            json!({"hex": hex, "tag": tag}),
+        );
+        check!(
+            tag.len() == "sha256-".len() + hex.len(),
+            "cosign_bundle_tag: length is exact",
+            json!({"hex_len": hex.len(), "tag_len": tag.len()}),
+        );
+
+        // Idempotent / pure.
+        let tag2 = algos::cosign_bundle_tag(&hex);
+        check!(
+            tag == tag2,
+            "cosign_bundle_tag: deterministic",
+            json!({"hex": hex}),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ghcr_repo_path
+// ---------------------------------------------------------------------------
+
+fn test_ghcr_repo_path() {
+    eprintln!("antithesis-tests: ghcr_repo_path");
+
+    let known: &[(&str, Option<&str>)] = &[
+        ("ghcr.io/imjasonh/esp32", Some("imjasonh/esp32")),
+        ("ghcr.io/", Some("")),
+        ("docker.io/library/alpine", None),
+        ("imjasonh/esp32", None),
+        ("", None),
+        // Substring match shouldn't fool us: prefix is anchored.
+        ("xghcr.io/imjasonh/esp32", None),
+    ];
+    for (input, expected) in known {
+        let got = algos::ghcr_repo_path(input);
+        check!(
+            got == *expected,
+            "ghcr_repo_path: known vectors",
+            json!({"input": input, "expected": expected, "got": got}),
+        );
+    }
+
+    // Property: for any random suffix `s`, ghcr_repo_path("ghcr.io/" + s) == Some(s).
+    for _ in 0..ITERS {
+        let len = (random::get_random() % 64) as usize;
+        let s: String = (0..len)
+            .map(|i| {
+                let pool = b"abcdefghijklmnopqrstuvwxyz0123456789-_/";
+                pool[((random::get_random() as usize) ^ i) % pool.len()] as char
+            })
+            .collect();
+        let full = format!("ghcr.io/{}", s);
+        let got = algos::ghcr_repo_path(&full);
+        check!(
+            got == Some(s.as_str()),
+            "ghcr_repo_path: prefix-strip round-trips for any suffix",
+            json!({"suffix": s, "full": full, "got": got}),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// digest_from_manifest_url
+// ---------------------------------------------------------------------------
+
+fn test_digest_from_manifest_url() {
+    eprintln!("antithesis-tests: digest_from_manifest_url");
+
+    let known: &[(&str, Option<&str>)] = &[
+        (
+            "https://ghcr.io/v2/imjasonh/esp32/manifests/sha256:abc",
+            Some("sha256:abc"),
+        ),
+        // Tag, not a digest — function still returns whatever's after the segment.
+        (
+            "https://ghcr.io/v2/imjasonh/esp32/manifests/latest",
+            Some("latest"),
+        ),
+        // No /manifests/ segment.
+        ("https://ghcr.io/v2/imjasonh/esp32/blobs/sha256:abc", None),
+        ("", None),
+        // Pathological: multiple /manifests/ segments → rsplit takes the last.
+        (
+            "https://ghcr.io/v2/imjasonh/manifests/repo/manifests/sha256:zzz",
+            Some("sha256:zzz"),
+        ),
+    ];
+    for (input, expected) in known {
+        let got = algos::digest_from_manifest_url(input);
+        check!(
+            got == *expected,
+            "digest_from_manifest_url: known vectors",
+            json!({"input": input, "expected": expected, "got": got}),
+        );
+    }
+
+    // Property: any URL we construct ourselves round-trips. This is
+    // the actual integration we care about — `fetch_manifest` builds
+    // these URLs and the publisher parses them back.
+    for _ in 0..ITERS {
+        let mut hex = String::with_capacity(64);
+        for _ in 0..64 {
+            hex.push(char::from_digit((random::get_random() % 16) as u32, 16).unwrap());
+        }
+        let digest = format!("sha256:{}", hex);
+        let url = format!("https://ghcr.io/v2/imjasonh/esp32/manifests/{}", digest);
+        let got = algos::digest_from_manifest_url(&url);
+        check!(
+            got == Some(digest.as_str()),
+            "digest_from_manifest_url: round-trips constructed URL",
+            json!({"digest": digest, "url": url, "got": got}),
+        );
     }
 }

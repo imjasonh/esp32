@@ -193,7 +193,7 @@ fn poll_once(
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("manifest has no layers"))?;
-    if layer.media_type != "application/vnd.esp32.firmware.bin" {
+    if layer.media_type != crate::algos::FIRMWARE_LAYER_MEDIA_TYPE {
         bail!("unexpected layer mediaType: {}", layer.media_type);
     }
     tracing::debug!(
@@ -248,8 +248,7 @@ fn poll_once(
 
 fn fetch_anon_token(repo: &str) -> Result<String> {
     // Strip the "ghcr.io/" prefix; the token endpoint wants "<owner>/<name>".
-    let repo_path = repo
-        .strip_prefix("ghcr.io/")
+    let repo_path = crate::algos::ghcr_repo_path(repo)
         .ok_or_else(|| anyhow!("only ghcr.io is supported for now (got {})", repo))?;
     let url = format!(
         "https://ghcr.io/token?service=ghcr.io&scope=repository:{}:pull",
@@ -266,8 +265,7 @@ fn fetch_anon_token(repo: &str) -> Result<String> {
 /// Returns the parsed manifest plus the hex SHA256 of the manifest bytes
 /// (the canonical digest that cosign signed).
 fn fetch_manifest(repo: &str, tag: &str, token: &str) -> Result<(Manifest, String)> {
-    let repo_path = repo
-        .strip_prefix("ghcr.io/")
+    let repo_path = crate::algos::ghcr_repo_path(repo)
         .ok_or_else(|| anyhow!("only ghcr.io is supported for now (got {})", repo))?;
     let url = format!("https://ghcr.io/v2/{}/manifests/{}", repo_path, tag);
     let auth = format!("Bearer {}", token);
@@ -299,11 +297,10 @@ fn fetch_signature_bundle(
     manifest_digest_hex: &str,
     token: &str,
 ) -> Result<Vec<u8>> {
-    let repo_path = repo
-        .strip_prefix("ghcr.io/")
+    let repo_path = crate::algos::ghcr_repo_path(repo)
         .ok_or_else(|| anyhow!("only ghcr.io is supported"))?;
     let auth = format!("Bearer {}", token);
-    let bundle_tag = format!("sha256-{}", manifest_digest_hex);
+    let bundle_tag = crate::algos::cosign_bundle_tag(manifest_digest_hex);
 
     // 1. Outer index
     let url1 = format!("https://ghcr.io/v2/{}/manifests/{}", repo_path, bundle_tag);
@@ -371,7 +368,7 @@ fn blob_for_sigstore_bundle(
     let layer = m
         .layers
         .iter()
-        .find(|l| l.media_type.starts_with("application/vnd.dev.sigstore.bundle."))
+        .find(|l| l.media_type.starts_with(crate::algos::SIGSTORE_BUNDLE_MEDIA_TYPE_PREFIX))
         .ok_or_else(|| anyhow!("sig manifest has no Sigstore bundle layer"))?;
     let url = format!("https://ghcr.io/v2/{}/blobs/{}", repo_path, layer.digest);
     let mut buf = Vec::with_capacity(layer.size as usize + 256);
@@ -413,8 +410,7 @@ fn fetch_to_buf(url: &str, headers: &[(&str, &str)], buf: &mut Vec<u8>) -> Resul
 }
 
 fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()> {
-    let repo_path = repo
-        .strip_prefix("ghcr.io/")
+    let repo_path = crate::algos::ghcr_repo_path(repo)
         .ok_or_else(|| anyhow!("only ghcr.io is supported"))?;
     let url = format!("https://ghcr.io/v2/{}/blobs/{}", repo_path, layer.digest);
     let auth = format!("Bearer {}", token);
@@ -440,9 +436,7 @@ fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()>
     let mut ota = EspOta::new().context("EspOta::new")?;
     let mut update = ota.initiate_update().context("initiate OTA update")?;
 
-    let expected_sha_hex = layer
-        .digest
-        .strip_prefix("sha256:")
+    let expected_sha_hex = crate::algos::strip_sha256_prefix(&layer.digest)
         .ok_or_else(|| anyhow!("non-sha256 digest: {}", layer.digest))?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 4096];
