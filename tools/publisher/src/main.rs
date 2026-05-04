@@ -164,6 +164,13 @@ async fn pull_verify(args: PullVerifyArgs) -> Result<()> {
         size = layer_descriptor.size,
         "layer descriptor",
     );
+    if layer_descriptor.media_type != LAYER_MEDIA_TYPE {
+        return Err(anyhow!(
+            "unexpected layer mediaType: got {}, want {}",
+            layer_descriptor.media_type,
+            LAYER_MEDIA_TYPE,
+        ));
+    }
 
     let mut layer_bytes = Vec::with_capacity(layer_descriptor.size as usize);
     client
