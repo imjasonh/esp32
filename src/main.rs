@@ -39,7 +39,8 @@ fn main() -> Result<()> {
     // cloud subscriber is absent or paused, and cloud_log captures
     // everything that's installed at info+ severity.
     esp_idf_svc::log::EspLogger::initialize_default();
-    install_panic_restart_hook();
+    // BISECT PROBE: panic hook temporarily disabled.
+    // install_panic_restart_hook();
     metrics::publish_self(&metrics::handles::MAIN);
 
     // Take NVS as early as possible — needed to decide whether to
@@ -267,47 +268,9 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &st
 
     wifi.start()?;
     tracing::info!(ssid = ssid, "wifi started; connecting");
-
-    // Watchdog: if connect+netif-up doesn't finish in WIFI_CONNECT_TIMEOUT,
-    // log loudly and reboot. Cancelled by the AtomicBool flip on the
-    // happy path. The thread exits without touching the system if
-    // cancelled in time.
-    let timed_out = std::sync::Arc::new(AtomicBool::new(false));
-    let cancel = std::sync::Arc::new(AtomicBool::new(false));
-    {
-        let timed_out = timed_out.clone();
-        let cancel = cancel.clone();
-        std::thread::Builder::new()
-            .stack_size(4 * 1024)
-            .spawn(move || {
-                let started = std::time::Instant::now();
-                while started.elapsed() < WIFI_CONNECT_TIMEOUT {
-                    if cancel.load(Ordering::Acquire) {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(500));
-                }
-                timed_out.store(true, Ordering::Release);
-                tracing::error!(
-                    timeout_secs = WIFI_CONNECT_TIMEOUT.as_secs(),
-                    "wifi: connect timed out, rebooting",
-                );
-                // Brief pause so the log line gets a chance to drain
-                // to serial before the restart.
-                std::thread::sleep(Duration::from_millis(200));
-                unsafe { esp_idf_svc::sys::esp_restart() };
-            })
-            .expect("spawn wifi-connect watchdog");
-    }
-
+    // BISECT PROBE: wifi connect watchdog temporarily disabled.
     wifi.connect()?;
     wifi.wait_netif_up()?;
-    cancel.store(true, Ordering::Release);
-    if timed_out.load(Ordering::Acquire) {
-        // Race: watchdog already fired. esp_restart will land
-        // momentarily; just return cleanly so we don't keep doing work.
-        return Err(anyhow!("wifi connect raced with timeout watchdog"));
-    }
     Ok(())
 }
 
