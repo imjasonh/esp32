@@ -28,10 +28,6 @@ use std::time::Duration;
 
 use crate::cloud_log::GcpConfig;
 
-/// `module_path!()` for this module — used by cloud_log to filter out
-/// our own tracing events without hardcoding the crate name.
-pub const TARGET: &str = module_path!();
-
 /// Set true while `ota::download_and_apply` is streaming a firmware
 /// blob (the only HTTPS call that *isn't* serialised by
 /// `ShortHttpsLock`). cloud_log + metrics check this before attempting

@@ -12,10 +12,9 @@
 //! `sa_key_pem`), the firmware boots normally with serial-only logs.
 
 use anyhow::{anyhow, Result};
-use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
+use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::{Event, Level, Subscriber};
@@ -26,13 +25,6 @@ use crate::gcp_auth::{
     device_mac, http_post, now_unix_secs, ota_download_in_progress, unix_to_rfc3339,
     ShortHttpsLock, TokenProvider,
 };
-use crate::nvs_util::{read_blob, read_str};
-
-/// `module_path!()` value for this module. Cross-referenced by other
-/// modules that want to filter events from cloud_log without
-/// hardcoding the crate name (which would silently break if
-/// `Cargo.toml [package].name` changes).
-pub const TARGET: &str = module_path!();
 
 const NVS_GCP_NS: &str = "gcp";
 const NVS_PROJECT_ID: &str = "project_id";
@@ -87,10 +79,10 @@ impl GcpConfig {
             }
         };
 
-        let project_id = read_str(&nvs, NVS_GCP_NS, NVS_PROJECT_ID, 96)?;
-        let sa_email = read_str(&nvs, NVS_GCP_NS, NVS_SA_EMAIL, 128)?;
-        let sa_key_id = read_str(&nvs, NVS_GCP_NS, NVS_SA_KEY_ID, 96)?;
-        let sa_key_pem = read_blob(&nvs, NVS_GCP_NS, NVS_SA_KEY_PEM, 4096)?;
+        let project_id = read_str(&nvs, NVS_PROJECT_ID, 96)?;
+        let sa_email = read_str(&nvs, NVS_SA_EMAIL, 128)?;
+        let sa_key_id = read_str(&nvs, NVS_SA_KEY_ID, 96)?;
+        let sa_key_pem = read_blob(&nvs, NVS_SA_KEY_PEM, 4096)?;
 
         match (project_id, sa_email, sa_key_id, sa_key_pem) {
             (Some(p), Some(e), Some(k), Some(pem)) => Ok(Some(Self {
@@ -110,7 +102,31 @@ impl GcpConfig {
     }
 }
 
-fn read_severity(nvs: &EspNvs<esp_idf_svc::nvs::NvsDefault>) -> Level {
+fn read_str(
+    nvs: &EspNvs<NvsDefault>,
+    key: &str,
+    max_len: usize,
+) -> Result<Option<String>> {
+    let mut buf = vec![0u8; max_len];
+    Ok(nvs
+        .get_str(key, &mut buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_GCP_NS, key, e))?
+        .map(|s| s.to_string()))
+}
+
+fn read_blob(
+    nvs: &EspNvs<NvsDefault>,
+    key: &str,
+    max_len: usize,
+) -> Result<Option<Vec<u8>>> {
+    let mut buf = vec![0u8; max_len];
+    Ok(nvs
+        .get_blob(key, &mut buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_GCP_NS, key, e))?
+        .map(|b| b.to_vec()))
+}
+
+fn read_severity(nvs: &EspNvs<NvsDefault>) -> Level {
     // 0=TRACE, 1=DEBUG, 2=INFO (default), 3=WARN, 4=ERROR
     match nvs.get_u8(NVS_MIN_SEVERITY).ok().flatten() {
         Some(0) => Level::TRACE,
@@ -164,12 +180,12 @@ impl LogQueue {
     }
 
     pub fn push(&self, mut entry: LogEntry) {
-        // Recover from a poisoned mutex rather than silently dropping
-        // every subsequent log entry forever (poisoning sticks for the
-        // life of the process). The protected state is just a deque +
-        // counters, so a partial mutation from a panicking caller is
-        // safe to keep using.
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            // Poisoned mutex: just give up on this entry rather than
+            // unwinding through the tracing layer.
+            Err(_) => return,
+        };
         // Apply any pending drop-counter to this entry, then drop oldest
         // if we're at capacity.
         entry.dropped_before = g.pending_dropped;
@@ -184,15 +200,20 @@ impl LogQueue {
 
     /// Drain up to `max` entries.
     pub fn drain(&self, max: usize) -> Vec<LogEntry> {
-        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut g = match self.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return vec![],
+        };
         let n = g.deque.len().min(max);
         g.deque.drain(..n).collect()
     }
 
     /// Current queue depth + lifetime drop count, for the metrics path.
     pub fn stats(&self) -> (usize, u64) {
-        let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        (g.deque.len(), g.dropped_total)
+        match self.inner.lock() {
+            Ok(g) => (g.deque.len(), g.dropped_total),
+            Err(_) => (0, 0),
+        }
     }
 }
 
@@ -214,12 +235,10 @@ impl<S: Subscriber> Layer<S> for CloudLogLayer {
         // pipeline themselves — otherwise their tracing calls land on
         // the queue they're draining (or that the metrics POST path
         // uses) and create a tight feedback loop.
-        // `TARGET` constants come from each module's `module_path!()`,
-        // so renaming the firmware crate doesn't silently break this.
         let target = event.metadata().target();
-        if target == TARGET
-            || target == crate::gcp_auth::TARGET
-            || target == crate::metrics::TARGET
+        if target == module_path!()
+            || target == "esp32_blinky::gcp_auth"
+            || target == "esp32_blinky::metrics"
         {
             return;
         }
@@ -320,18 +339,11 @@ pub fn run(
     let log_name = format!("projects/{}/logs/esp32-firmware", cfg.project_id);
 
     let mut consecutive_failures: u32 = 0;
-    // Monotonic per-process counter used (with the device MAC) to
-    // build a unique `insertId` for each log entry, so Cloud Logging
-    // preserves stable order within a single second of wall time.
-    let insert_seq: AtomicU64 = AtomicU64::new(0);
     loop {
         let sleep_for = if consecutive_failures > 0 {
             // Exponential backoff capped at 5 min for cloud-logging
-            // failures (separate budget from the OTA loop). With
-            // FLUSH_INTERVAL = 5 s, exp = 6 hits the 320 s peak which
-            // we then cap at 300 s; smaller exp caps would never reach
-            // the 5-min ceiling at all.
-            let exp = consecutive_failures.min(6);
+            // failures (separate budget from the OTA loop).
+            let exp = consecutive_failures.min(5);
             Duration::from_secs(FLUSH_INTERVAL.as_secs() << exp).min(Duration::from_secs(300))
         } else {
             FLUSH_INTERVAL
@@ -373,15 +385,7 @@ pub fn run(
             }
         };
 
-        match post_batch(
-            &log_name,
-            &cfg.project_id,
-            &mac,
-            fw_version,
-            &bearer,
-            &batch,
-            &insert_seq,
-        ) {
+        match post_batch(&log_name, &cfg.project_id, &mac, fw_version, &bearer, &batch) {
             Ok(()) => {
                 tracing::debug!(
                     entries = batch.len(),
@@ -436,12 +440,6 @@ struct Entry {
     json_payload: serde_json::Value,
     #[serde(rename = "timestamp", skip_serializing_if = "Option::is_none")]
     timestamp: Option<String>,
-    /// Cloud Logging uses `insertId` to break ties on equal timestamps
-    /// (and to dedupe re-sent entries). Our timestamps are
-    /// second-resolution, so without this, Cloud Logging UI tends to
-    /// shuffle within-second log lines on read.
-    #[serde(rename = "insertId")]
-    insert_id: String,
 }
 
 fn post_batch(
@@ -451,7 +449,6 @@ fn post_batch(
     fw_version: &str,
     bearer: &str,
     batch: &[LogEntry],
-    insert_seq: &AtomicU64,
 ) -> Result<()> {
     let entries: Vec<Entry> = batch
         .iter()
@@ -459,7 +456,6 @@ fn post_batch(
             severity: severity_str(e.severity),
             json_payload: build_payload(e, fw_version),
             timestamp: e.timestamp_unix_secs.and_then(unix_to_rfc3339),
-            insert_id: format!("{}-{}", mac, insert_seq.fetch_add(1, Ordering::Relaxed)),
         })
         .collect();
 

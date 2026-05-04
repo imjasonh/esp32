@@ -1,18 +1,19 @@
 use anyhow::{anyhow, Result};
+use embedded_svc::http::client::Client;
 use esp_idf_svc::eventloop::EspSystemEventLoop;
 use esp_idf_svc::hal::peripherals::Peripherals;
+use esp_idf_svc::http::client::{Configuration as HttpConfig, EspHttpConnection};
+use esp_idf_svc::http::Method;
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp_idf_svc::wifi::{
     AuthMethod, BlockingWifi, ClientConfiguration, Configuration as WifiConfig, EspWifi,
 };
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 mod cloud_log;
 mod gcp_auth;
 mod metrics;
-mod nvs_util;
 mod ota;
 mod sig;
 mod trust;
@@ -29,18 +30,7 @@ const FW_VERSION: &str = env!("GIT_SHA");
 
 fn main() -> Result<()> {
     esp_idf_svc::sys::link_patches();
-    // Initialize ESP-IDF's log facade backend. Our tracing events
-    // reach this through the `tracing/log-always` feature
-    // (Cargo.toml): tracing emits a `log` record alongside its own
-    // event, EspLogger consumes the log record and prints it on the
-    // serial console. The `tracing_subscriber::registry().with(layer)`
-    // we install below adds a *second* sink (cloud_log's queue), so
-    // events are observed by both — serial keeps working when the
-    // cloud subscriber is absent or paused, and cloud_log captures
-    // everything that's installed at info+ severity.
     esp_idf_svc::log::EspLogger::initialize_default();
-    // BISECT PROBE: panic hook temporarily disabled.
-    // install_panic_restart_hook();
     metrics::publish_self(&metrics::handles::MAIN);
 
     // Take NVS as early as possible — needed to decide whether to
@@ -76,11 +66,6 @@ fn main() -> Result<()> {
     let sysloop = EspSystemEventLoop::take()?;
 
     // Read remaining NVS config; strict-inert if missing. See ota.md.
-    // Note: a hard NVS read error (corrupt partition, hardware fault)
-    // propagates via `?` and main returns Err — ESP-IDF then panics +
-    // reboots, which is the right behaviour because we can't recover
-    // without intact NVS. The `block_unprovisioned` arm is only for
-    // *missing* keys (a fresh device that hasn't been provisioned yet).
     let (ssid, pass) = match read_wifi_creds(nvs.clone())? {
         Some(creds) => creds,
         None => block_unprovisioned("wifi/ssid or wifi/pass missing in NVS"),
@@ -138,6 +123,9 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    fetch("https://api.ipify.org?format=json")?;
+    fetch("https://wttr.in/?format=3")?;
 
     if pending_verify {
         match ota::mark_valid_after_pending_verify_passed(nvs.clone()) {
@@ -235,17 +223,6 @@ fn log_running_partition() {
     }
 }
 
-/// Cap on how long we'll sit in `wifi.connect()` + `wait_netif_up()`
-/// before giving up and rebooting. Bad creds, a moved AP, or a flaky
-/// driver state can otherwise hang main forever — and on a
-/// PENDING_VERIFY image, hanging here means we never reach
-/// `mark_valid_after_pending_verify_passed`, so eventually the
-/// bootloader rolls us back. Rebooting on the watchdog gives us a
-/// fresh boot cycle (and faster rollback if the new image is the
-/// problem). 60 s is generous enough to ride out a slow DHCP exchange
-/// while still being well under the OTA pending-verify safety budget.
-const WIFI_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
-
 fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &str) -> Result<()> {
     let auth_method = if pass.is_empty() {
         AuthMethod::None
@@ -268,7 +245,6 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &st
 
     wifi.start()?;
     tracing::info!(ssid = ssid, "wifi started; connecting");
-    // BISECT PROBE: wifi connect watchdog temporarily disabled.
     wifi.connect()?;
     wifi.wait_netif_up()?;
     Ok(())
@@ -278,10 +254,16 @@ fn connect_wifi(wifi: &mut BlockingWifi<EspWifi<'static>>, ssid: &str, pass: &st
 fn read_wifi_creds(partition: EspDefaultNvsPartition) -> Result<Option<(String, String)>> {
     let nvs = EspNvs::new(partition, NVS_WIFI_NS, false)
         .map_err(|e| anyhow!("open NVS namespace {}: {:?}", NVS_WIFI_NS, e))?;
-    let ssid = nvs_util::read_str(&nvs, NVS_WIFI_NS, NVS_WIFI_SSID, 64)?;
-    let pass = nvs_util::read_str(&nvs, NVS_WIFI_NS, NVS_WIFI_PASS, 96)?;
+    let mut ssid_buf = [0u8; 64];
+    let mut pass_buf = [0u8; 96];
+    let ssid = nvs
+        .get_str(NVS_WIFI_SSID, &mut ssid_buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_WIFI_NS, NVS_WIFI_SSID, e))?;
+    let pass = nvs
+        .get_str(NVS_WIFI_PASS, &mut pass_buf)
+        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_WIFI_NS, NVS_WIFI_PASS, e))?;
     match (ssid, pass) {
-        (Some(s), Some(p)) => Ok(Some((s, p))),
+        (Some(s), Some(p)) => Ok(Some((s.to_string(), p.to_string()))),
         _ => Ok(None),
     }
 }
@@ -299,21 +281,34 @@ fn block_unprovisioned(reason: &str) -> ! {
     }
 }
 
-/// Take ownership of panic recovery: log via the previous hook (so the
-/// usual panic banner still hits the serial console), then `esp_restart`
-/// directly instead of letting `panic = "abort"`'s post-hook abort
-/// path land us in ESP-IDF's generic panic handler. The explicit
-/// restart gives the queued cloud_log batch a brief moment to flush
-/// and yields a clean reboot reason in the boot log. On a
-/// PENDING_VERIFY image this still triggers rollback on the next
-/// boot; in steady state the OTA loop + log queue both resume cleanly.
-fn install_panic_restart_hook() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        prev(info);
-        // Brief pause so the panic message reaches the serial console
-        // (and the next cloud_log flush, if any) before we restart.
-        std::thread::sleep(Duration::from_millis(500));
-        unsafe { esp_idf_svc::sys::esp_restart() };
-    }));
+fn fetch(url: &str) -> Result<()> {
+    let conn = EspHttpConnection::new(&HttpConfig {
+        crt_bundle_attach: Some(esp_idf_svc::sys::esp_crt_bundle_attach),
+        ..Default::default()
+    })?;
+    let mut client = Client::wrap(conn);
+
+    let req = client.request(Method::Get, url, &[("accept", "*/*")])?;
+    let mut resp = req.submit()?;
+    let status = resp.status();
+
+    let mut buf = [0u8; 1024];
+    let mut total = 0usize;
+    let mut body = Vec::with_capacity(512);
+    loop {
+        let n = resp.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        body.extend_from_slice(&buf[..n]);
+    }
+    tracing::debug!(
+        url = url,
+        status = status,
+        bytes = total,
+        body = %String::from_utf8_lossy(&body).trim(),
+        "GET",
+    );
+    Ok(())
 }
