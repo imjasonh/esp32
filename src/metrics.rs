@@ -24,6 +24,10 @@ use crate::gcp_auth::{
 
 const METRIC_PREFIX: &str = "custom.googleapis.com/esp32";
 
+/// `module_path!()` for this module — used by cloud_log to filter out
+/// our own tracing events without hardcoding the crate name.
+pub const TARGET: &str = module_path!();
+
 /// FreeRTOS task handles published by each spawned thread so the
 /// metrics loop can call `uxTaskGetStackHighWaterMark` per task.
 /// Stored as `usize` (not `*mut c_void`) so we can use atomics; 0

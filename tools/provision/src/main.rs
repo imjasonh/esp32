@@ -50,6 +50,12 @@ struct Cli {
     /// firmware build uses; ensures script deps are present).
     #[arg(long, default_value = ".embuild/espressif/python_env/idf5.2_py3.12_env/bin/python")]
     python: PathBuf,
+
+    /// If true, only emit the NVS CSV and identities staging file; do
+    /// NOT run nvs_partition_gen.py. Useful for CI parsing checks where
+    /// the embuild artifacts aren't installed.
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -121,6 +127,29 @@ struct OtaProvisioningConfig {
     poll_secs: Option<u32>,
 }
 
+/// Emit a loud warning if the resolved service-account key path lives
+/// inside the repo. It's gitignored by convention but we'd rather
+/// flag it explicitly — putting the SA key elsewhere (a `~/.config`
+/// location with restricted perms) is the safer default.
+fn warn_if_in_repo(sa_key: &Path, repo_dir: &Path) {
+    let key = match sa_key.canonicalize() {
+        Ok(p) => p,
+        // If canonicalize fails the file probably doesn't exist yet;
+        // nvs_partition_gen.py will fail loudly on its own.
+        Err(_) => return,
+    };
+    let repo = match repo_dir.canonicalize() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+    if key.starts_with(&repo) {
+        tracing::warn!(
+            path = %key.display(),
+            "sa_key_pem lives inside the repo — keep it gitignored, chmod 600, and consider moving it outside the worktree",
+        );
+    }
+}
+
 fn severity_to_u8(s: &str) -> Result<u8> {
     match s.to_ascii_lowercase().as_str() {
         "trace" => Ok(0),
@@ -172,6 +201,11 @@ fn main() -> Result<()> {
         // Validate severity now (before writing CSV) so a typo fails
         // fast with a clear error.
         severity_to_u8(&gcp.min_severity)?;
+        // Warn if the SA private key is sitting in the repo directory.
+        // It's gitignored by convention (gcp-sa-key.pem) but we'd
+        // rather flag it loudly: the operator should keep it
+        // somewhere out of the repo and `chmod 600`.
+        warn_if_in_repo(&gcp.sa_key_pem, &config_dir);
     }
 
     tracing::info!(
@@ -181,7 +215,7 @@ fn main() -> Result<()> {
         "loaded provisioning config",
     );
 
-    if !args.nvs_gen.exists() {
+    if !args.dry_run && !args.nvs_gen.exists() {
         bail!(
             "{} not found — run `make build` once so embuild clones ESP-IDF",
             args.nvs_gen.display()
@@ -218,6 +252,17 @@ fn main() -> Result<()> {
     .context("write NVS CSV")?;
     tracing::info!(path = %csv_path.display(), "wrote NVS CSV");
 
+    if args.dry_run {
+        tracing::info!(
+            csv = %csv_path.display(),
+            "dry-run: skipping nvs_partition_gen.py and flash",
+        );
+        // Still clean up the identities staging file: it contains the
+        // (public) trust identities only, but no need to leave it.
+        let _ = std::fs::remove_file(&identities_json_path);
+        return Ok(());
+    }
+
     // Run nvs_partition_gen.py.
     let status = Command::new(&args.python)
         .arg(&args.nvs_gen)
@@ -236,6 +281,11 @@ fn main() -> Result<()> {
         bytes = bin_size,
         "generated NVS partition image",
     );
+    // Clean up staged inputs that are no longer needed. We keep the
+    // generated NVS .bin (the user may want to re-flash it) and the
+    // CSV (useful for inspection), but the identities JSON is purely
+    // an intermediate file.
+    let _ = std::fs::remove_file(&identities_json_path);
 
     if args.flash {
         tracing::info!(

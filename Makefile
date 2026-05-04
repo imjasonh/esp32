@@ -184,8 +184,13 @@ $(FW_BIN): build
 
 # Build firmware -> save-image -> push OCI artifact to OCI_REPO. Tags
 # pushed: :latest and :sha-<short>. Requires GH_TOKEN in gh.env.
+#
+# `set -eo pipefail` so a publisher crash doesn't get swallowed by the
+# `| grep | head | cut` pipeline and silently produce an empty DIGEST
+# (we'd catch it with the test below, but pipefail makes the original
+# error message visible).
 publish: $(FW_BIN) check-gh-env
-	@set -e; \
+	@set -eo pipefail; \
 	    . ./gh.env; \
 	    DIGEST=$$(cd tools/publisher && cargo run --release --target $(HOST_TRIPLE) -- push \
 	        --bin $(CURDIR)/$(FW_BIN) \

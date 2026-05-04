@@ -1,24 +1,33 @@
 //! Cosign Sigstore Bundle (v0.3) verification for OTA artifacts.
 //!
 //! Phase 4a scope: verify the DSSE signature, the cert chain to the
-//! bundled Sigstore intermediate (and root), and the cert's identity
-//! against `trust::TRUSTED_IDENTITIES`. Also verifies the in-toto
-//! Statement payload binds to our manifest digest.
+//! bundled Sigstore intermediate (and root), the cert's identity
+//! against `trust::TRUSTED_IDENTITIES`, the DSSE `payloadType`, and
+//! each cert's notBefore/notAfter window against the device wall
+//! clock. Also verifies the in-toto Statement payload binds to our
+//! manifest digest.
 //!
-//! Phase 4b will add the Rekor SET (transparency log) check and a
-//! validity-window check using the Rekor-attested signing time.
+//! Phase 4b will add the Rekor SET (transparency log) check and use
+//! the Rekor-attested signing time for the validity check (instead of
+//! `now`), which closes the post-expiry-but-pre-attestation window.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use p256::ecdsa::signature::Verifier as _;
 use serde::Deserialize;
-use sha2::{Digest, Sha256, Sha384};
 use x509_cert::der::{oid::ObjectIdentifier, Decode, Encode};
 use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::ext::pkix::SubjectAltName;
 use x509_cert::Certificate;
 
+use crate::gcp_auth::now_unix_secs;
 use crate::trust::TrustConfig;
+
+/// DSSE payload type cosign emits for OCI artifact signatures. We
+/// reject anything else: a different payload type means the bundle
+/// signs something other than an in-toto Statement, and our digest
+/// binding check below would be against the wrong shape of payload.
+const DSSE_INTOTO_PAYLOAD_TYPE: &str = "application/vnd.in-toto+json";
 
 // X.509 OID for Sigstore's "OIDC issuer (legacy)" extension. The value
 // is the raw issuer URL bytes (not DER-wrapped). Fulcio also emits
@@ -79,6 +88,14 @@ pub fn verify_bundle(
 ) -> Result<()> {
     let bundle: Bundle = serde_json::from_slice(bundle_json).context("parse bundle JSON")?;
 
+    if bundle.dsse_envelope.payload_type != DSSE_INTOTO_PAYLOAD_TYPE {
+        bail!(
+            "unexpected DSSE payloadType: {} (want {})",
+            bundle.dsse_envelope.payload_type,
+            DSSE_INTOTO_PAYLOAD_TYPE,
+        );
+    }
+
     let cert_der = b64_std()
         .decode(&bundle.verification_material.certificate.raw_bytes)
         .context("base64-decode leaf cert")?;
@@ -98,8 +115,16 @@ pub fn verify_bundle(
     verify_chain(&leaf, trust).context("cert chain verification")?;
     tracing::info!("ota: cert chain to Sigstore root OK");
 
+    // Use the first DSSE signature (cosign emits exactly one). `.first()`
+    // rather than `[0]` so a malformed bundle returns an error instead
+    // of panicking the OTA thread.
+    let dsse_sig = bundle
+        .dsse_envelope
+        .signatures
+        .first()
+        .ok_or_else(|| anyhow!("DSSE envelope has no signatures"))?;
     let sig_bytes = b64_std()
-        .decode(&bundle.dsse_envelope.signatures[0].sig)
+        .decode(&dsse_sig.sig)
         .context("base64-decode DSSE signature")?;
     let payload_bytes = b64_std()
         .decode(&bundle.dsse_envelope.payload)
@@ -200,12 +225,42 @@ fn extract_oidc_issuer_v1(cert: &Certificate) -> Result<String> {
 
 /// Verify leaf was signed by the provisioned Sigstore intermediate, and
 /// that the provisioned intermediate was signed by the provisioned root.
+/// Also checks each cert's `notBefore` / `notAfter` window against the
+/// device's wall clock — without this, an exfiltrated Fulcio leaf cert
+/// (10-min validity by design) would remain accepted indefinitely from
+/// the verifier's perspective. Phase 4b will tighten this further by
+/// using the Rekor SET's signing time instead of `now`, which closes
+/// the post-expiry-but-pre-Rekor-attestation window.
 fn verify_chain(leaf: &Certificate, trust: &TrustConfig) -> Result<()> {
     let intermediate = pem_to_cert(&trust.fulcio_intermediate_pem)?;
     let root = pem_to_cert(&trust.fulcio_root_pem)?;
 
+    check_validity(leaf, "leaf").context("leaf validity window")?;
+    check_validity(&intermediate, "intermediate").context("intermediate validity window")?;
+    check_validity(&root, "root").context("root validity window")?;
+
     verify_signed_by_p384(leaf, &intermediate).context("leaf -> intermediate")?;
     verify_signed_by_p384(&intermediate, &root).context("intermediate -> root")?;
+    Ok(())
+}
+
+/// Reject certs whose `notBefore`/`notAfter` window doesn't include
+/// the current wall-clock time. Requires NTP sync; if the clock isn't
+/// synced (caller should always have triggered SNTP before getting
+/// here, but the OTA thread can in principle race with sync) we refuse
+/// to verify rather than fall back to "always valid".
+fn check_validity(cert: &Certificate, label: &str) -> Result<()> {
+    let now =
+        now_unix_secs().ok_or_else(|| anyhow!("clock not synced; cannot check {} validity", label))?;
+    let validity = &cert.tbs_certificate.validity;
+    let nb = validity.not_before.to_unix_duration().as_secs();
+    let na = validity.not_after.to_unix_duration().as_secs();
+    if now < nb {
+        bail!("{} cert not yet valid: now={} notBefore={}", label, now, nb);
+    }
+    if now > na {
+        bail!("{} cert expired: now={} notAfter={}", label, now, na);
+    }
     Ok(())
 }
 
@@ -260,10 +315,3 @@ fn verify_p256_ecdsa(cert: &Certificate, message: &[u8], sig_der: &[u8]) -> Resu
     Ok(())
 }
 
-// Quiet the Sha256/Sha384 imports if not used elsewhere in this file
-// after refactoring; they're imported eagerly in case future helpers
-// need to hash explicitly.
-#[allow(dead_code)]
-fn _unused_keep_imports() -> (Sha256, Sha384) {
-    (Sha256::new(), Sha384::new())
-}
