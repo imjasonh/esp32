@@ -189,6 +189,12 @@ $(FW_BIN): build
 # `| grep | head | cut` pipeline and silently produce an empty DIGEST
 # (we'd catch it with the test below, but pipefail makes the original
 # error message visible).
+#
+# Target-specific SHELL := bash because `pipefail` isn't a POSIX
+# `set -o` option — the default `/bin/sh` on Ubuntu (dash) rejects it
+# with "Illegal option -o pipefail" before any other command runs. We
+# only need bash for this one recipe; everything else stays on /bin/sh.
+publish: SHELL := /bin/bash
 publish: $(FW_BIN) check-gh-env
 	@set -eo pipefail; \
 	    . ./gh.env; \
