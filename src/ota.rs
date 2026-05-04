@@ -12,7 +12,9 @@ use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 use esp_idf_svc::ota::EspOta;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use crate::nvs_util::read_str;
 
 const NVS_NAMESPACE: &str = "ota";
 const NVS_LAST_DIGEST: &str = "last_digest";
@@ -24,6 +26,13 @@ const NVS_PENDING_DIGEST: &str = "pending_digest";
 const NVS_REPO: &str = "repo";
 const NVS_TAG: &str = "tag";
 const NVS_POLL_SECS: &str = "poll_secs";
+
+// Read buffers for NVS strings. Digests are 71 bytes
+// (`sha256:` + 64 hex). Repo/tag are operator-set OCI references
+// which can run long for nested orgs/names; 256 B is generous and
+// well within NVS's per-entry capacity.
+const NVS_DIGEST_BUF: usize = 96;
+const NVS_REPOTAG_BUF: usize = 256;
 
 const BACKOFF_CAP: Duration = Duration::from_secs(3600); // 1h max between polls
 
@@ -48,11 +57,15 @@ impl Default for OtaConfig {
 impl OtaConfig {
     fn load_from_nvs(nvs: &EspNvs<NvsDefault>) -> Self {
         let mut cfg = Self::default();
-        if let Some(repo) = read_string(nvs, NVS_REPO) {
-            cfg.repo = repo;
+        if let Some(repo) = read_repotag(nvs, NVS_REPO) {
+            if !repo.is_empty() {
+                cfg.repo = repo;
+            }
         }
-        if let Some(tag) = read_string(nvs, NVS_TAG) {
-            cfg.tag = tag;
+        if let Some(tag) = read_repotag(nvs, NVS_TAG) {
+            if !tag.is_empty() {
+                cfg.tag = tag;
+            }
         }
         if let Ok(Some(secs)) = nvs.get_u32(NVS_POLL_SECS) {
             if secs > 0 {
@@ -105,7 +118,7 @@ pub fn run(
     };
 
     let cfg = OtaConfig::load_from_nvs(&nvs);
-    let last = read_string(&nvs, NVS_LAST_DIGEST).unwrap_or_else(|| "<none>".into());
+    let last = read_digest(&nvs, NVS_LAST_DIGEST).unwrap_or_else(|| "<none>".into());
     tracing::info!(
         fw = fw_version,
         repo = %cfg.repo,
@@ -164,6 +177,9 @@ fn backoff_with_jitter(base: Duration, failures: u32) -> Duration {
 /// Apply ±10% jitter using the ESP32's hardware RNG. Used on the success
 /// path too so a fleet doesn't poll in lockstep.
 fn jittered(base: Duration) -> Duration {
+    // Catches an upstream bug where someone wires a 0 s poll interval
+    // to this function — the loop would then spin without sleeping.
+    debug_assert!(base.as_secs() >= 1, "jittered() needs base >= 1 s");
     let r: u32 = unsafe { esp_idf_svc::sys::esp_random() };
     let pct = (r % 21) as i32 - 10; // -10..=+10
     let secs = base.as_secs() as i64;
@@ -210,7 +226,7 @@ fn poll_once(
         "ota: manifest",
     );
 
-    let last = read_string(nvs, NVS_LAST_DIGEST).unwrap_or_default();
+    let last = read_digest(nvs, NVS_LAST_DIGEST).unwrap_or_default();
     if last == layer.digest {
         return Ok(PollOutcome::NoChange);
     }
@@ -224,14 +240,24 @@ fn poll_once(
     // Re-acquire the lock for the network calls; release before the
     // CPU-bound `verify_bundle` so cloud_log/metrics aren't blocked
     // behind our X.509 + ECDSA work.
+    //
+    // We reuse the GHCR pull token from phase 1. GHCR's token TTL is
+    // short (~5 min) but covers the gap of one `verify_bundle` even on
+    // the slow Xtensa P-256/P-384 path; if we ever observe 401s here
+    // because of clock skew or slow verify, re-mint at the start of
+    // phase 2.
     let bundle = {
         let _l = short_https.map(|m| m.lock().unwrap_or_else(|e| e.into_inner()));
         fetch_signature_bundle(&cfg.repo, &manifest_digest_hex, &token)
             .context("fetch signature bundle")?
     };
+    let verify_start = Instant::now();
     crate::sig::verify_bundle(&bundle, &manifest_digest_hex, trust)
         .context("verify signature bundle")?;
-    tracing::info!("ota: signature verified, proceeding with download");
+    tracing::info!(
+        verify_ms = verify_start.elapsed().as_millis() as u64,
+        "ota: signature verified, proceeding with download",
+    );
 
     // Phase 3 — long blob download. Deliberately UNLOCKED so a
     // multi-second download doesn't block per-5-s cloud_log flushes
@@ -337,11 +363,16 @@ fn fetch_signature_bundle(
         digest: String,
     }
     let inner_digest = if let Ok(idx) = serde_json::from_slice::<Index>(&buf1) {
-        idx.manifests
-            .first()
-            .ok_or_else(|| anyhow!("sig index has no manifests"))?
-            .digest
-            .clone()
+        // Sigstore bundle indexes are single-platform; reject anything
+        // else so we don't silently pick the first of several manifests
+        // a registry might return for an unexpected layout.
+        if idx.manifests.len() != 1 {
+            bail!(
+                "sig index has {} manifests, expected exactly 1",
+                idx.manifests.len()
+            );
+        }
+        idx.manifests[0].digest.clone()
     } else {
         // Fallback: outer is already the manifest itself
         let m: Manifest = serde_json::from_slice(&buf1)
@@ -486,12 +517,16 @@ fn download_and_apply(repo: &str, layer: &Descriptor, token: &str) -> Result<()>
     Ok(())
 }
 
-fn read_string(nvs: &EspNvs<NvsDefault>, key: &str) -> Option<String> {
-    let mut buf = [0u8; 96];
-    match nvs.get_str(key, &mut buf) {
-        Ok(Some(s)) => Some(s.to_string()),
-        _ => None,
-    }
+/// 96 B buffer — covers `sha256:` + 64 hex with headroom.
+fn read_digest(nvs: &EspNvs<NvsDefault>, key: &str) -> Option<String> {
+    read_str(nvs, NVS_NAMESPACE, key, NVS_DIGEST_BUF).ok().flatten()
+}
+
+/// 256 B buffer — operator-set OCI references can be long (nested orgs,
+/// long repo names); the prior 96 B silently fell back to defaults if a
+/// repo string overflowed.
+fn read_repotag(nvs: &EspNvs<NvsDefault>, key: &str) -> Option<String> {
+    read_str(nvs, NVS_NAMESPACE, key, NVS_REPOTAG_BUF).ok().flatten()
 }
 
 fn write_string(nvs: &mut EspNvs<NvsDefault>, key: &str, value: &str) -> Result<()> {
@@ -538,7 +573,7 @@ pub fn mark_valid_after_pending_verify_passed(
 
     let mut nvs = EspNvs::new(nvs_partition, NVS_NAMESPACE, true)
         .context("open ota NVS namespace")?;
-    if let Some(pending) = read_string(&nvs, NVS_PENDING_DIGEST) {
+    if let Some(pending) = read_digest(&nvs, NVS_PENDING_DIGEST) {
         write_string(&mut nvs, NVS_LAST_DIGEST, &pending)?;
         // Best-effort clear of pending; not fatal if it fails.
         let _ = nvs.remove(NVS_PENDING_DIGEST);

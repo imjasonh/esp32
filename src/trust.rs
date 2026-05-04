@@ -18,6 +18,8 @@ use anyhow::{anyhow, Context, Result};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use serde::Deserialize;
 
+use crate::nvs_util::read_blob;
+
 const NVS_TRUST_NS: &str = "trust";
 const NVS_IDENTITIES: &str = "identities";
 const NVS_FULCIO_ROOT: &str = "fulcio_root";
@@ -49,9 +51,9 @@ impl TrustConfig {
 
         // PEMs are ~3KB; identities JSON is ~500 bytes. 4KB buffers
         // give comfortable headroom for now.
-        let id_bytes = read_blob(&nvs, NVS_IDENTITIES, 4096)?;
-        let root_bytes = read_blob(&nvs, NVS_FULCIO_ROOT, 4096)?;
-        let inter_bytes = read_blob(&nvs, NVS_FULCIO_INTER, 4096)?;
+        let id_bytes = read_blob(&nvs, NVS_TRUST_NS, NVS_IDENTITIES, 4096)?;
+        let root_bytes = read_blob(&nvs, NVS_TRUST_NS, NVS_FULCIO_ROOT, 4096)?;
+        let inter_bytes = read_blob(&nvs, NVS_TRUST_NS, NVS_FULCIO_INTER, 4096)?;
 
         match (id_bytes, root_bytes, inter_bytes) {
             (Some(id), Some(root), Some(inter)) => {
@@ -73,17 +75,3 @@ impl TrustConfig {
     }
 }
 
-fn read_blob(
-    nvs: &EspNvs<esp_idf_svc::nvs::NvsDefault>,
-    key: &str,
-    max_size: usize,
-) -> Result<Option<Vec<u8>>> {
-    let mut buf = vec![0u8; max_size];
-    match nvs
-        .get_blob(key, &mut buf)
-        .map_err(|e| anyhow!("read NVS {}/{}: {:?}", NVS_TRUST_NS, key, e))?
-    {
-        Some(bytes) => Ok(Some(bytes.to_vec())),
-        None => Ok(None),
-    }
-}
