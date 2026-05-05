@@ -277,18 +277,22 @@ callbacks and our snapshot logic). Match the metrics thread budget.
 
 ## Implementation phases
 
-1. **Phase 1 — minimum viable peripheral.** NimBLE init, advertise
-   with name from NVS, expose Device Information Service only.
-   Verify on iOS with nRF Connect. ~80 LOC in a new `src/ble.rs`,
-   plus the `[ble]` loader and `sdkconfig.defaults.in` knobs.
-   Confirm heap headroom on the metrics dashboard before merging.
-2. **Phase 2 — diagnostic service + dashboard.** Custom 128-bit
-   service with read+notify chars (uptime, free heap, RSSI, IP, OTA
-   state). Hook into the existing 5 s `metrics` tick — same snapshot,
-   extra fan-out. Then the static
-   `tools/ble-dashboard/index.html` page that connects, subscribes,
-   and renders a live panel. Tested on iOS Bluefy + Android Chrome.
-   Optionally publish via GitHub Pages workflow.
+1. **Phase 1 — minimum viable peripheral.** ✅ Shipped. NimBLE init,
+   advertise with name from NVS, expose Device Information Service.
+   Verify on iOS with nRF Connect. ~140 LOC in `src/ble.rs`, plus
+   `[ble]` loader, provision-tool support, and the
+   `sdkconfig.defaults.in` knobs.
+2. **Phase 2 — diagnostic service + dashboard.** ✅ Shipped. Custom
+   128-bit service with eight chars (uptime / free heap / min free
+   heap / wifi SSID / wifi RSSI / IPv4 / boot partition / OTA state).
+   Read + notify on the dynamic ones, refreshed by `ble::run`'s own
+   5 s tick (independent of `metrics_interval_secs`, which defaults to
+   300 s and is too slow for a phone dashboard). Static one-pager at
+   `tools/ble-dashboard/index.html` consumes them via Web Bluetooth —
+   tested in Chrome desktop, Android Chrome, and iOS Bluefy.
+   Filter is `namePrefix: "esp32-"` plus `optionalServices` for the
+   custom + DIS UUIDs, so the 31-byte legacy adv budget stays small
+   (no need to fit a 128-bit UUID alongside the name).
 3. **Phase 3 — write support.** Add the passkey-protected control
    characteristics: force-OTA-poll, reboot, push e-ink message
    (depends on `docs/eink-plan.md`). Flip the link to LE Secure

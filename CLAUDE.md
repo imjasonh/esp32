@@ -9,11 +9,13 @@ src/sig.rs                  cosign Sigstore Bundle verification
 src/trust.rs                NVS-loaded trust config (signer identities + Sigstore CAs)
 src/cloud_log.rs            tracing → Cloud Logging (queue + sender thread)
 src/metrics.rs              chip-health snapshots → Cloud Monitoring time series
+src/ble.rs                  NimBLE peripheral: DIS + custom diagnostic GATT service
 src/gcp_auth.rs             multi-scope JWT mint, shared TokenProvider, ShortHttpsLock,
                             OtaDownloadGuard, HTTPS helpers
 trust/                      Sigstore Fulcio root + intermediate certs (provisioned via NVS)
 tools/publisher/            host-side tool that pushes signed OCI artifacts to GHCR
 tools/provision/            host-side tool that builds + flashes NVS partition
+tools/ble-dashboard/        single-file Web Bluetooth dashboard for the BLE GATT
 .github/workflows/          ci.yml (PRs) + publish.yml (push to main)
 Cargo.toml                  firmware deps
 partitions.csv              OTA-capable partition table (1.94 MB app slots)
