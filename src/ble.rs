@@ -30,7 +30,7 @@
 use anyhow::{anyhow, Result};
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs};
 use esp32_nimble::{
-    utilities::{BleUuid, Mutex},
+    utilities::{mutex::Mutex, BleUuid},
     uuid128, BLEAdvertisementData, BLECharacteristic, BLEDevice, NimbleProperties,
 };
 use std::ffi::CStr;
