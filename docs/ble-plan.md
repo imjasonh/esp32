@@ -6,20 +6,37 @@ handful of read-only "what is this thing" attributes — firmware version,
 uptime, free heap, IP address, RSSI, OTA state. No phone-side build for
 the first cut: we use a standard BLE explorer app to view the GATT.
 
-## Scope of v1
+## Goals
 
-- Power on → BLE advertising starts after Wi-Fi is up.
-- Advertised local name: `esp32-<last4-of-mac>` (e.g. `esp32-A3F2`).
-- One standard GATT service: **Device Information Service (0x180A)** —
+- The device advertises a recognizable name and one or more GATT
+  services after boot.
+- An **iOS** user can connect from a browser and see live status. This
+  drives the dashboard choice (Web Bluetooth) — Safari refuses to
+  ship it, so we target third-party iOS browsers
+  (**Bluefy** / **WebBLE**) which expose `navigator.bluetooth` via
+  WKWebView. Same HTML works in Chrome on Android and desktop.
+- BLE is **opt-in via NVS**: presence of a `[ble]` section in
+  `provisioning.toml` switches it on, exactly like the existing `[gcp]`
+  block. Absent → BLE init is skipped entirely (no flash bloat
+  benefit, but ~45 KB heap saved).
+- Read characteristics first; write characteristics + pairing land
+  later.
+
+## Scope of v1 (smallest working thing)
+
+- BLE init when `[ble]` is configured in NVS, advertised name from
+  config (default `esp32-<last4-of-mac>`).
+- One standard service: **Device Information Service (0x180A)** —
   manufacturer, model, firmware revision (= `FW_VERSION` git SHA),
   hardware revision, serial number (= base MAC).
-- One custom GATT service exposing live diagnostic state. Read + notify
-  on dynamic chars (uptime, heap, RSSI), read-only on static ones.
-- No pairing, no encryption — diagnostic data only, link is connectable
-  by anyone in range. Pairing comes in v2 if/when we add write
-  characteristics (reboot, force-OTA-poll, etc.).
-- Connect from a phone using **nRF Connect** (Android/iOS) or
-  **LightBlue Explorer** to verify everything is wired up. No app to build.
+- A handful of custom diagnostic chars (uptime, free heap, RSSI, IP).
+  Read + notify; the metrics thread already snapshots these every 5 s.
+- No pairing, no encryption. Read-only.
+- Verify on iOS using **nRF Connect for iOS** (native explorer app,
+  free) before touching the dashboard.
+- Then a one-page Web Bluetooth dashboard checked into
+  `tools/ble-dashboard/`, viewable on iOS in **Bluefy**, on Android in
+  Chrome, on desktop in Chrome/Edge.
 
 ## Stack choice: NimBLE, not Bluedroid
 
@@ -149,52 +166,87 @@ The notify cadence reuses the existing 5 s metrics tick — same
 snapshot the `metrics` thread already builds, just an extra fan-out to
 BLE subscribers.
 
-## Phone-side options for v1 (no app to build)
+## Phone / browser viewing options
 
-1. **nRF Connect** — Nordic, free, Android + iOS. Most powerful: full
-   GATT browser, decoders for standard characteristics, log of every
-   ATT request, can save device profile. **Recommended.**
-2. **LightBlue Explorer** — Punch Through, free, Android + iOS.
-   Friendlier UI, slightly less detail; good first impression.
-3. **Web Bluetooth from Chrome on Android** — `navigator.bluetooth.requestDevice(...)`,
-   no app install. Doesn't work on iOS Safari (Apple disables it).
-   Useful if we want a one-pager dashboard later.
-4. **`bluetoothctl` / `bluetoothd` on Linux** — fine for desktop testing.
+The iOS Web Bluetooth situation drives this:
 
-Path of least resistance: install nRF Connect on the phone, scan,
-connect, screenshot the DIS + custom service. That's "v1 done".
+- **Apple Safari does not implement Web Bluetooth** and has signalled
+  no intent to. Workarounds that *do* work today on iOS:
+  - **Bluefy – Web BLE Browser** (App Store, free) — Chromium-based
+    WKWebView shim that exposes `navigator.bluetooth.*`. Same HTML,
+    same JS as Chrome desktop.
+  - **WebBLE** (App Store, paid one-time) — same idea, older.
+  - **nRF Connect for iOS** — native explorer, not a browser, but
+    works without us writing any phone code.
 
-## Phone-side options for later (with build effort)
+Recommended path:
 
-- **Web Bluetooth dashboard**: a single static HTML page (host on
-  GitHub Pages or load from a USB stick) that connects, subscribes to
-  the notify chars, and renders a live status panel. ~200 LOC of JS.
-  Android/desktop only.
-- **Flutter app** with `flutter_blue_plus`: works on iOS + Android,
-  ~1 day of work for a polished status screen.
-- **Native iOS (CoreBluetooth) / Android (BluetoothLeScanner)**: most
+1. **Bring-up / debugging**: nRF Connect (iOS, Android, free). Full
+   GATT browser, raw ATT log, save device profile.
+2. **Day-to-day "look at my thing"**: a single static HTML in
+   `tools/ble-dashboard/index.html`, opened in Bluefy on iPhone or
+   Chrome on Android/desktop. Hosted on GitHub Pages from `main`.
+3. **Power-user / scripting**: `bluetoothctl` on Linux desktops.
+
+Later (with build effort) if the Web Bluetooth dashboard hits its
+ceiling:
+
+- **Flutter app** (`flutter_blue_plus`) — iOS + Android, gives us
+  background scanning, push notifications on state change.
+- **Native iOS CoreBluetooth / Android BluetoothLeScanner** — most
   control, most code.
-- **Tasker / Shortcuts**: phone automation that pings the device and
-  triggers something on disconnect/reconnect. Cute, niche.
+- **Apple Shortcuts / Android Tasker** — phone automation that pings
+  the device and triggers something on (re)connect.
+
+## NVS config schema
+
+New `[ble]` block in `provisioning.toml`. Presence opts in; absence
+skips BLE init entirely (mirrors `[gcp]`):
+
+```toml
+[ble]
+# Optional. Defaults to "esp32-<last4-of-mac>" if omitted.
+name = "kitchen-esp"
+
+# Phase 3 (writes): enable encrypted-link writes with this passkey.
+# Six digits, 000000–999999. Omit to keep BLE read-only.
+# passkey = 314159
+```
+
+NVS keys (15-char cap — see CLAUDE.md):
+
+| Namespace | Key | Type | Notes |
+|--|--|--|--|
+| `ble` | `name` | str | optional; falls back to mac-suffix default |
+| `ble` | `passkey` | u32 | optional; phase 3 only |
+
+Loader pattern matches `cloud_log::GcpConfig::load` —
+`ble::Config::load(nvs) -> Result<Option<Config>>`, `Some(_)` only
+when the namespace exists.
 
 ## Security
 
 v1: no pairing, no bonding, no encryption. Read-only diagnostic data
-is exposed unauthenticated to anyone in BLE range. That's the same
-threat surface as our serial console, which is fine for a desk
-device.
+is exposed unauthenticated to anyone in BLE range. Same threat
+surface as our serial console — fine for a desk device.
 
-If/when we add **write** characteristics — reboot, force-OTA-poll,
-clear NVS, etc. — flip to:
+When we add **write** characteristics — reboot, force-OTA-poll,
+display message, clear NVS, etc. — flip to:
 
-- LE Secure Connections (ECDH key agreement, MITM-protected) with a
-  static passkey provisioned via NVS (new namespace `ble`, key
-  `passkey`, 6 digits).
-- Encrypted-link required on writeable chars; reads stay open.
-- Bonding optional (we don't really need to remember devices).
+- LE Secure Connections (ECDH key agreement, MITM-protected) with the
+  static `passkey` from NVS.
+- Encrypted-link required on writeable chars; read chars stay open so
+  the dashboard works for casual viewers.
+- Bonding optional. Without it, the user re-enters the passkey each
+  reconnect, which is fine for an occasional control surface and
+  saves us NVS storage of bond keys.
 
 Don't reach for "just works" pairing — it's no real security, and the
 NVS-provisioned passkey path is cheap.
+
+Web Bluetooth + pairing on iOS Bluefy: pairing prompts surface
+through the OS the same way they would for a native app, so this is
+all routine — no special dance needed.
 
 ## Lifecycle
 
@@ -217,24 +269,30 @@ main()
           └─ notify subscribers
 ```
 
-NVS toggle: a `[ble] enabled = true|false` block in
-`provisioning.toml` so devices that don't need it skip BLE init
-entirely (saves ~45 KB heap). Default true.
+Opt-in is by `[ble]` section presence in NVS — see "NVS config
+schema" above. No boolean toggle.
 
 Stack budget: 16 KB seems right (no crypto, no HTTPS — just NimBLE
 callbacks and our snapshot logic). Match the metrics thread budget.
 
 ## Implementation phases
 
-1. **Phase 1 — minimum viable peripheral.** NimBLE init, advertise,
-   Device Information Service only. Verify with nRF Connect. ~80 LOC
-   in a new `src/ble.rs`. Adjust `sdkconfig.defaults.in`. Confirm
-   heap headroom on the metrics dashboard before merging.
-2. **Phase 2 — diagnostic service.** Custom 128-bit service with the
-   read+notify chars listed above. Hook into the existing 5 s
-   `metrics` tick so we don't run two timers.
-3. **Phase 3 (optional) — Web Bluetooth dashboard.** Static HTML in
-   `tools/ble-dashboard/`, served from GitHub Pages on each push.
+1. **Phase 1 — minimum viable peripheral.** NimBLE init, advertise
+   with name from NVS, expose Device Information Service only.
+   Verify on iOS with nRF Connect. ~80 LOC in a new `src/ble.rs`,
+   plus the `[ble]` loader and `sdkconfig.defaults.in` knobs.
+   Confirm heap headroom on the metrics dashboard before merging.
+2. **Phase 2 — diagnostic service + dashboard.** Custom 128-bit
+   service with read+notify chars (uptime, free heap, RSSI, IP, OTA
+   state). Hook into the existing 5 s `metrics` tick — same snapshot,
+   extra fan-out. Then the static
+   `tools/ble-dashboard/index.html` page that connects, subscribes,
+   and renders a live panel. Tested on iOS Bluefy + Android Chrome.
+   Optionally publish via GitHub Pages workflow.
+3. **Phase 3 — write support.** Add the passkey-protected control
+   characteristics: force-OTA-poll, reboot, push e-ink message
+   (depends on `docs/eink-plan.md`). Flip the link to LE Secure
+   Connections + encryption for writes.
 
 ## Future ideas (cool : effort)
 
