@@ -38,6 +38,7 @@ pub mod handles {
     pub static OTA: AtomicUsize = AtomicUsize::new(0);
     pub static CLOUD_LOG: AtomicUsize = AtomicUsize::new(0);
     pub static METRICS: AtomicUsize = AtomicUsize::new(0);
+    pub static BLE: AtomicUsize = AtomicUsize::new(0);
 }
 
 /// Each thread calls this once at start of its run loop.
@@ -208,6 +209,7 @@ fn collect(queue: &LogQueue) -> Snapshot {
         ("ota", &handles::OTA),
         ("cloud_log", &handles::CLOUD_LOG),
         ("metrics", &handles::METRICS),
+        ("ble", &handles::BLE),
     ] {
         if let Some(h) = read_handle(slot) {
             let bytes = unsafe { esp_idf_svc::sys::uxTaskGetStackHighWaterMark(h) };

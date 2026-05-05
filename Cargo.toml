@@ -50,6 +50,12 @@ base64 = "0.22"
 rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
 # RFC 3339 timestamp formatting for Cloud Logging entries.
 time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+# BLE peripheral: NimBLE host on top of ESP-IDF's bluedroid-disabled
+# / NimBLE-enabled controller. esp32-nimble wraps the C API into a
+# higher-level builder + closure-callback Rust API. 0.12 is the first
+# release that tracks esp-idf-svc 0.52; older 0.10/0.11 pin to 0.51
+# and won't resolve. See docs/ble-plan.md.
+esp32-nimble = "0.12"
 
 [build-dependencies]
 embuild = "0.33"

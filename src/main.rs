@@ -9,6 +9,7 @@ use std::ffi::CStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+mod ble;
 mod cloud_log;
 mod gcp_auth;
 mod metrics;
@@ -47,6 +48,7 @@ fn main() -> Result<()> {
     // events fire.
     let nvs = EspDefaultNvsPartition::take()?;
     let gcp = cloud_log::GcpConfig::load(nvs.clone())?;
+    let ble_cfg = ble::Config::load(nvs.clone())?;
     let log_queue = if let Some(ref cfg) = gcp {
         let queue = cloud_log::LogQueue::new(cloud_log::QUEUE_CAPACITY);
         let layer = cloud_log::CloudLogLayer::new(queue.clone(), cfg.min_severity);
@@ -64,6 +66,11 @@ fn main() -> Result<()> {
         tracing::info!("cloud_log: subscribed");
     } else {
         tracing::info!("cloud_log: not configured (no [gcp] in NVS), serial only");
+    }
+    if ble_cfg.is_some() {
+        tracing::info!("ble: configured, will advertise after wifi up");
+    } else {
+        tracing::info!("ble: not configured (no [ble] in NVS), peripheral disabled");
     }
 
     let pending_verify = ota::is_pending_verify();
@@ -167,6 +174,16 @@ fn main() -> Result<()> {
         .stack_size(48 * 1024)
         .spawn(move || ota::run(ota_nvs, FW_VERSION, ota_trust, Some(ota_lock)))
         .expect("spawn ota thread");
+
+    if let Some(cfg) = ble_cfg {
+        std::thread::Builder::new()
+            // NimBLE host runs in its own internal FreeRTOS task; this
+            // thread only owns the one-shot setup + (later) the
+            // notify-update tick. 8 KB is plenty.
+            .stack_size(8 * 1024)
+            .spawn(move || ble::run(cfg, FW_VERSION))
+            .expect("spawn ble thread");
+    }
 
     if let (Some(cfg), Some(queue)) = (gcp, log_queue) {
         // Build the shared TokenProvider once — both cloud_log and

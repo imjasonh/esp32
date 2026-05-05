@@ -1,0 +1,282 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>esp32-blinky · BLE dashboard</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1a1a1a;
+    --muted: #666;
+    --bg: #fafafa;
+    --card: #fff;
+    --border: #e5e5e5;
+    --accent: #2563eb;
+    --good: #16a34a;
+    --bad: #dc2626;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --fg: #e5e5e5;
+      --muted: #999;
+      --bg: #0f0f0f;
+      --card: #1a1a1a;
+      --border: #2a2a2a;
+      --accent: #60a5fa;
+      --good: #4ade80;
+      --bad: #f87171;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    color: var(--fg);
+    background: var(--bg);
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 1rem; }
+  h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 1rem; }
+  button {
+    font: inherit;
+    padding: 0.5rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  button.secondary {
+    background: transparent;
+    color: var(--accent);
+  }
+  .status {
+    margin: 0.75rem 0;
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+  }
+  .status.connected { border-color: var(--good); }
+  .status.error { border-color: var(--bad); color: var(--bad); }
+  section.card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.75rem;
+  }
+  section.card h2 {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 0 0 0.5rem;
+    font-weight: 600;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 0.3rem 0; vertical-align: top; font-variant-numeric: tabular-nums; }
+  td.k { color: var(--muted); width: 11rem; }
+  td.v { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; word-break: break-all; }
+  td.v.pending { color: var(--muted); font-style: italic; }
+  .footer { color: var(--muted); font-size: 0.75rem; margin-top: 1.5rem; line-height: 1.5; }
+  .footer a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <h1>esp32-blinky</h1>
+  <div class="sub">BLE diagnostic dashboard · phone or laptop</div>
+
+  <div>
+    <button id="connect">Connect</button>
+    <button id="disconnect" class="secondary" disabled>Disconnect</button>
+  </div>
+  <div id="status" class="status">Not connected.</div>
+
+  <section class="card">
+    <h2>Identity</h2>
+    <table>
+      <tr><td class="k">Manufacturer</td><td class="v pending" data-id="manufacturer">—</td></tr>
+      <tr><td class="k">Model</td><td class="v pending" data-id="model">—</td></tr>
+      <tr><td class="k">Hardware</td><td class="v pending" data-id="hardware">—</td></tr>
+      <tr><td class="k">Firmware</td><td class="v pending" data-id="firmware">—</td></tr>
+      <tr><td class="k">Serial (MAC)</td><td class="v pending" data-id="serial">—</td></tr>
+      <tr><td class="k">Boot partition</td><td class="v pending" data-id="boot_partition">—</td></tr>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>Live</h2>
+    <table>
+      <tr><td class="k">Uptime</td><td class="v pending" data-id="uptime_secs">—</td></tr>
+      <tr><td class="k">Free heap</td><td class="v pending" data-id="free_heap">—</td></tr>
+      <tr><td class="k">Min free heap</td><td class="v pending" data-id="min_free_heap">—</td></tr>
+      <tr><td class="k">Wi-Fi SSID</td><td class="v pending" data-id="wifi_ssid">—</td></tr>
+      <tr><td class="k">Wi-Fi RSSI</td><td class="v pending" data-id="wifi_rssi">—</td></tr>
+      <tr><td class="k">IPv4</td><td class="v pending" data-id="ipv4">—</td></tr>
+      <tr><td class="k">OTA state</td><td class="v pending" data-id="ota_state">—</td></tr>
+    </table>
+  </section>
+
+  <div class="footer">
+    Web Bluetooth: works in Chrome / Edge on Android, ChromeOS, and desktop.
+    On iOS, open this page in <a href="https://apps.apple.com/app/bluefy-web-ble-browser/id1492822055">Bluefy</a> —
+    Safari refuses to ship Web Bluetooth.
+  </div>
+</main>
+
+<script>
+"use strict";
+
+const DIAG_SERVICE = "5f6c2a00-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_UPTIME      = "5f6c2a01-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_FREE_HEAP   = "5f6c2a02-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_MIN_HEAP    = "5f6c2a03-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_WIFI_SSID   = "5f6c2a04-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_WIFI_RSSI   = "5f6c2a05-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_IPV4        = "5f6c2a06-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_BOOT_PART   = "5f6c2a07-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+const C_OTA_STATE   = "5f6c2a08-fa9d-4d8a-bf8f-01a3c8ab9d9e";
+
+let device = null;
+
+const $ = (sel) => document.querySelector(sel);
+const status = (msg, kind) => {
+  const el = $("#status");
+  el.textContent = msg;
+  el.className = "status" + (kind ? " " + kind : "");
+};
+const set = (id, value) => {
+  const el = document.querySelector(`[data-id="${id}"]`);
+  if (!el) return;
+  el.textContent = value;
+  el.classList.remove("pending");
+};
+const reset = () => {
+  document.querySelectorAll("[data-id]").forEach((el) => {
+    el.textContent = "—";
+    el.classList.add("pending");
+  });
+};
+
+const td = new TextDecoder();
+const fmtBytes = (n) => {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KiB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MiB`;
+};
+const fmtUptime = (s) => {
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d) return `${d}d ${h}h ${m}m ${sec}s`;
+  if (h) return `${h}h ${m}m ${sec}s`;
+  if (m) return `${m}m ${sec}s`;
+  return `${sec}s`;
+};
+
+// Each row: [data-id, char UUID, decoder fn(DataView) -> string]
+const LIVE = [
+  ["uptime_secs",   C_UPTIME,    (dv) => fmtUptime(dv.getUint32(0, true))],
+  ["free_heap",     C_FREE_HEAP, (dv) => fmtBytes(dv.getUint32(0, true))],
+  ["min_free_heap", C_MIN_HEAP,  (dv) => fmtBytes(dv.getUint32(0, true))],
+  ["wifi_ssid",     C_WIFI_SSID, (dv) => td.decode(dv.buffer) || "(disconnected)"],
+  ["wifi_rssi",     C_WIFI_RSSI, (dv) => `${dv.getInt8(0)} dBm`],
+  ["ipv4",          C_IPV4,      (dv) => `${dv.getUint8(0)}.${dv.getUint8(1)}.${dv.getUint8(2)}.${dv.getUint8(3)}`],
+  ["ota_state",     C_OTA_STATE, (dv) => ["idle", "downloading"][dv.getUint8(0)] || `?(${dv.getUint8(0)})`],
+];
+
+const STATIC_DIS = [
+  ["manufacturer", "manufacturer_name_string"],
+  ["model",        "model_number_string"],
+  ["hardware",     "hardware_revision_string"],
+  ["firmware",     "firmware_revision_string"],
+  ["serial",       "serial_number_string"],
+];
+
+async function readUtf8(svc, charId, key) {
+  try {
+    const c = await svc.getCharacteristic(charId);
+    const v = await c.readValue();
+    set(key, td.decode(v.buffer) || "—");
+  } catch (e) {
+    console.warn(`read ${key}:`, e);
+  }
+}
+
+async function bindLive(svc, key, charId, decode) {
+  const c = await svc.getCharacteristic(charId);
+  const v = await c.readValue();
+  set(key, decode(v));
+  await c.startNotifications();
+  c.addEventListener("characteristicvaluechanged", (e) => {
+    set(key, decode(e.target.value));
+  });
+}
+
+async function connect() {
+  if (!navigator.bluetooth) {
+    status("Web Bluetooth not supported. Use Chrome on Android/desktop, or Bluefy on iOS.", "error");
+    return;
+  }
+  $("#connect").disabled = true;
+  status("Requesting device…");
+  try {
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "esp32-" }],
+      optionalServices: [DIAG_SERVICE, "device_information"],
+    });
+    device.addEventListener("gattserverdisconnected", onDisconnected);
+
+    status(`Connecting to ${device.name}…`);
+    const server = await device.gatt.connect();
+    status(`Connected to ${device.name}`, "connected");
+    $("#disconnect").disabled = false;
+
+    // DIS — read once. The service is a fast in-RAM table on the
+    // peripheral, so a tight serial loop is fine.
+    const dis = await server.getPrimaryService("device_information");
+    for (const [key, charId] of STATIC_DIS) {
+      await readUtf8(dis, charId, key);
+    }
+
+    // Custom diagnostic service — read once + subscribe to notify.
+    const diag = await server.getPrimaryService(DIAG_SERVICE);
+    const bootPart = await diag.getCharacteristic(C_BOOT_PART);
+    const bootVal = await bootPart.readValue();
+    set("boot_partition", td.decode(bootVal.buffer) || "—");
+    for (const [key, charId, decode] of LIVE) {
+      await bindLive(diag, key, charId, decode);
+    }
+  } catch (e) {
+    status(`Error: ${e.message}`, "error");
+    console.error(e);
+    $("#connect").disabled = false;
+  }
+}
+
+function onDisconnected() {
+  status("Disconnected.", "error");
+  $("#connect").disabled = false;
+  $("#disconnect").disabled = true;
+  reset();
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) {
+    device.gatt.disconnect();
+  }
+}
+
+$("#connect").addEventListener("click", connect);
+$("#disconnect").addEventListener("click", disconnect);
+</script>
+</body>
+</html>
