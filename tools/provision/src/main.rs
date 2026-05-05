@@ -68,6 +68,9 @@ struct ProvisioningConfig {
     /// (`ghcr.io/imjasonh/esp32:latest`, 60 s poll). All fields are
     /// individually optional too; only present ones override defaults.
     ota: Option<OtaProvisioningConfig>,
+    /// Optional. If absent, the firmware never initializes BLE. Presence
+    /// of the section opts in; fields inside are individually optional.
+    ble: Option<BleProvisioningConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -125,6 +128,14 @@ struct OtaProvisioningConfig {
     tag: Option<String>,
     /// Override the OTA poll interval in seconds. Default 60.
     poll_secs: Option<u32>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct BleProvisioningConfig {
+    /// GAP local name. Default `esp32-<last4-of-mac>` (computed
+    /// firmware-side). Max ~28 bytes to fit alongside the service UUID
+    /// in the 31-byte legacy advertising payload.
+    name: Option<String>,
 }
 
 /// Emit a loud warning if the resolved service-account key path lives
@@ -212,6 +223,7 @@ fn main() -> Result<()> {
         identities = cfg.trust.identities.len(),
         ssid = cfg.wifi.ssid,
         gcp = cfg.gcp.is_some(),
+        ble = cfg.ble.is_some(),
         "loaded provisioning config",
     );
 
@@ -399,6 +411,16 @@ fn write_csv(
         }
         if let Some(poll_secs) = ota.poll_secs {
             wtr.write_record(&["poll_secs", "data", "u32", &poll_secs.to_string()])?;
+        }
+    }
+
+    // ble namespace (optional). Presence-only opt-in: writing the
+    // namespace at all enables BLE on the device, even if every field
+    // inside is absent. Key names match src/ble.rs's NVS_NAME constant.
+    if let Some(ble) = &cfg.ble {
+        wtr.write_record(&["ble", "namespace", "", ""])?;
+        if let Some(name) = &ble.name {
+            wtr.write_record(&["name", "data", "string", name])?;
         }
     }
 

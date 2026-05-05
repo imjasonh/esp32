@@ -49,3 +49,16 @@ issuer = "https://token.actions.githubusercontent.com"
 # repo = "ghcr.io/imjasonh/esp32"   # default
 # tag = "latest"                    # default
 # poll_secs = 600                   # default 60; bump for steady-state fleets
+
+# Optional. If absent, the firmware never initializes BLE. Presence
+# of this section opts the device in; the peripheral starts
+# advertising after Wi-Fi is up. Phase 1 exposes only the read-only
+# Device Information Service (manufacturer / model / firmware version
+# / hardware / serial). Connect from nRF Connect / LightBlue / Bluefy
+# (iOS) to view it. See docs/ble-plan.md.
+#
+# [ble]
+# # Optional. Defaults to "esp32-<last4-of-mac>" if omitted. Keep <=28
+# # bytes so it fits in the 31-byte legacy advertising payload alongside
+# # the service UUID.
+# name = "kitchen-esp"

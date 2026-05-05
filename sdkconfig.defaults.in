@@ -46,3 +46,23 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # for our 1.5MB-each OTA partition layout.
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# BLE peripheral. NimBLE host (smaller than Bluedroid, BLE-only). The
+# whole stack is gated behind src/ble.rs's [ble]-namespace NVS check at
+# runtime — leaving these enabled for devices that don't ship BLE
+# costs ~110 KB flash but no extra heap (controller isn't init'd
+# unless ble::run() is started). See docs/ble-plan.md.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+# BLE-only mode (no BR/EDR / Classic). Halves the controller's flash
+# footprint and frees IRAM we'd otherwise reserve for Classic.
+CONFIG_BTDM_CTRL_MODE_BLE_ONLY=y
+CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY=n
+CONFIG_BTDM_CTRL_MODE_BTDM=n
+# We expect at most one phone connected at a time.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# Wi-Fi/BT coexistence scheduler — both share the single 2.4 GHz radio.
+# Wi-Fi takes priority; BLE advertising and a single connection coexist
+# fine in practice. Without this, Wi-Fi handshake races with BLE adv
+# and one of them fails intermittently.
+CONFIG_SW_COEXIST_ENABLE=y
