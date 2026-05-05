@@ -122,8 +122,10 @@ fn setup(cfg: &Config, fw_version: &'static str) -> Result<()> {
     let mac = device_mac();
 
     let device = BLEDevice::take();
-    device
-        .set_device_name(&cfg.device_name)
+    // `set_device_name` is an associated function on BLEDevice (no
+    // self) — it writes the global `ble_svc_gap_device_name`. Method-
+    // call syntax doesn't work here.
+    BLEDevice::set_device_name(&cfg.device_name)
         .map_err(|e| anyhow!("set_device_name: {:?}", e))?;
 
     let server = device.get_server();
