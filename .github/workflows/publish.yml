@@ -75,7 +75,7 @@ jobs:
         # patch versions. Pin to the latest v4.x. (v4 installs cosign 3
         # by default, which produces the Sigstore Bundle v0.3 format
         # the on-device verifier in src/sig.rs parses.)
-        uses: sigstore/cosign-installer@v4.1.1
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Write gh.env from GITHUB_TOKEN
         env:
