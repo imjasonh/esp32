@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install cmake + ninja
         run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
@@ -52,7 +52,7 @@ jobs:
       # index sync + dep download). The .embuild cache also primes
       # earlier — same restore time, just less time-to-build at the end.
       - name: Cache .embuild (ESP-IDF + tools)
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: .embuild
           key: embuild-v5.2.2-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'rust-toolchain.toml', '.cargo/config.toml') }}
@@ -75,7 +75,7 @@ jobs:
         # patch versions. Pin to the latest v4.x. (v4 installs cosign 3
         # by default, which produces the Sigstore Bundle v0.3 format
         # the on-device verifier in src/sig.rs parses.)
-        uses: sigstore/cosign-installer@v4.1.1
+        uses: sigstore/cosign-installer@v4.1.2
 
       - name: Write gh.env from GITHUB_TOKEN
         env:
