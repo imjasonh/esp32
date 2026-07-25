@@ -44,8 +44,8 @@ hex = "0.4"
 # Phase 4a: cosign Sigstore Bundle verification.
 p256 = { version = "0.13", features = ["ecdsa"] }      # leaf signs DSSE
 p384 = { version = "0.13", features = ["ecdsa"] }      # intermediate signs leaf
-x509-cert = { version = "0.2", features = ["pem"] }
-base64 = "0.22"
+x509-cert = { version = "0.3", features = ["pem"] }
+base64 = "0.23"
 # Cloud Logging: RSA-PKCS#1v1.5 SHA-256 signing for service-account JWTs.
 rsa = { version = "0.9", default-features = false, features = ["std", "pem", "sha2"] }
 # RFC 3339 timestamp formatting for Cloud Logging entries.
